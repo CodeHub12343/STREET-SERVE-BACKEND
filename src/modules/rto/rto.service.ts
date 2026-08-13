@@ -849,7 +849,16 @@ export const rtoService = {
        * account of the condition into an agreed fact.
        */
       condition_delivery: conditionReportToDoc(input.condition ?? {}, { customerAck: true }),
-      ownership_credited_cents: quote.initialOwnershipCreditCents,
+      /**
+       * **Zero, until a card has actually been confirmed.**
+       *
+       * This was seeded with the initial payment's ownership credit at the moment the agreement was
+       * written — before any money moved, and in practice before any money EVER moved, because the
+       * charge below only opened a PaymentIntent. A customer could accept and immediately own 20% of
+       * a laptop they had not paid a cent for. Ownership is credited in `creditByPaymentIntent`,
+       * off the `payment_intent.succeeded` webhook, and nowhere else.
+       */
+      ownership_credited_cents: 0,
       installments_paid: 0,
       next_due_at: quote.schedule[0] ? new Date(now + quote.schedule[0].dueOffsetDays * 86_400_000) : null,
       status: 'active',
@@ -878,49 +887,45 @@ export const rtoService = {
       })),
     );
 
-    // Charge the initial payment (fee applies per payment) + optional setup fee; append to ledger.
-    if (quote.initialPaymentCents > 0) {
+    /**
+     * ═══ OPEN the charge for everything due today. Do not pretend it settled. ═══
+     *
+     * **One intent, not two.** The initial payment and the set-up fee were charged as separate
+     * PaymentIntents, which was survivable only while nothing collected a card: the moment a real
+     * customer is asked to confirm, two intents means two card forms for one "accept" — and a
+     * customer who confirms the first and abandons the second leaves an agreement that is half paid
+     * for, with no screen that can finish it. They are one payment because they are one decision.
+     *
+     * The set-up fee rides in `serviceFeeCents` so it is excluded from the RTO fee base. That
+     * reproduces the previous economics exactly — `setup` carries no platform rate, and the
+     * `rto_installment` fee applied to the initial payment alone — while charging a fee on a fee is
+     * avoided by the same rule that governs every other customer-paid fee component (R8/R10).
+     *
+     * Nothing is written to the ledger here and no ownership is credited. The ledger is the money
+     * record; appending to it for money that is still sitting behind an unconfirmed card is how the
+     * books came to disagree with Stripe in the first place.
+     */
+    const dueNowCents = quote.initialPaymentCents + quote.setupFeeCents;
+    let clientSecret: string | null = null;
+    let paymentIntentRef: string | null = null;
+    if (dueNowCents > 0) {
       const charge = await paymentsService.charge({
         customerId: principal.userId,
         counterpartyType: 'business',
         counterpartyId: sellerId,
-        amountCents: quote.initialPaymentCents,
+        amountCents: dueNowCents,
+        ...(quote.setupFeeCents > 0 ? { serviceFeeCents: quote.setupFeeCents } : {}),
         feeType: 'rto_installment',
-        idempotencyKey: `${idempotencyKey}_initial`,
+        idempotencyKey: `${idempotencyKey}_acceptance`,
       });
-      await repo.appendLedger({
-        agreement_id: agreementId,
-        entry_type: 'initial',
-        installment_number: null,
-        amount_cents: quote.initialPaymentCents,
-        fee_cents: charge.platformFeeCents ?? 0,
-        ownership_credit_cents: quote.initialOwnershipCreditCents,
-        transaction_id: charge.transactionId,
-        idempotency_key: `rto_initial_${agreementId}`,
+      clientSecret = charge.clientSecret ?? null;
+      paymentIntentRef = charge.paymentIntentRef ?? null;
+      await repo.updateAgreement(agreementId, {
+        pending_intent_ref: paymentIntentRef,
+        pending_intent_kind: 'acceptance',
       });
-      await paymentsService.completeForOrder(charge.transactionId); // capture-at-acceptance
-      await this.recordSplit(agreement, null, 'initial', quote.initialPaymentCents);
-    }
-    if (quote.setupFeeCents > 0) {
-      const setup = await paymentsService.charge({
-        customerId: principal.userId,
-        counterpartyType: 'business',
-        counterpartyId: sellerId,
-        amountCents: quote.setupFeeCents,
-        feeType: 'setup',
-        idempotencyKey: `${idempotencyKey}_setup`,
-      });
-      await repo.appendLedger({
-        agreement_id: agreementId,
-        entry_type: 'setup_fee',
-        installment_number: null,
-        amount_cents: quote.setupFeeCents,
-        fee_cents: setup.platformFeeCents ?? 0,
-        ownership_credit_cents: 0,
-        transaction_id: setup.transactionId,
-        idempotency_key: `rto_setup_${agreementId}`,
-      });
-      await paymentsService.completeForOrder(setup.transactionId);
+      agreement.pending_intent_ref = paymentIntentRef;
+      agreement.pending_intent_kind = 'acceptance';
     }
 
     await writeAudit({
@@ -928,10 +933,21 @@ export const rtoService = {
       action: 'rto.agreement_accepted',
       entityType: 'rto_agreement',
       entityId: agreementId,
-      metadata: { sellerId: sellerId, totalToOwnCents: quote.totalToOwnCents },
+      metadata: { sellerId: sellerId, totalToOwnCents: quote.totalToOwnCents, dueNowCents },
     });
     await publish('rto.agreement_accepted', { agreementId, customerId: principal.userId });
-    return this.dashboardFrom(agreement, quote);
+    return {
+      ...this.dashboardFrom(agreement, quote),
+      /**
+       * The client secret the acceptance screen needs to actually collect the card. Null only when
+       * there is genuinely nothing to pay today (no initial payment, no set-up fee) — the screen
+       * distinguishes the two, because "no card needed" and "we could not start your payment" look
+       * identical to a customer and only one of them is fine.
+       */
+      clientSecret,
+      paymentIntentRef,
+      amountDueNowCents: dueNowCents,
+    };
   },
 
   /**
@@ -961,6 +977,13 @@ export const rtoService = {
       ) {
         continue;
       }
+      /**
+       * The deposit has not cleared yet. Billing instalment #1 against a customer whose very first
+       * payment is still unconfirmed would charge them for an agreement they have not actually
+       * entered — and a decline here would put them straight into Grace for a schedule that never
+       * legitimately started.
+       */
+      if (agreement.pending_intent_kind === 'acceptance') continue;
       try {
         const charge = await paymentsService.charge({
           customerId: agreement.customer_id,
@@ -1213,11 +1236,37 @@ Keep this reference. It is your record that the item is yours.`,
     if (['completed', 'cancelled'].includes(agreement.status)) {
       throw ConflictError(ERROR_CODES.INVALID_STATE_TRANSITION, `Agreement is ${agreement.status}`);
     }
+    /**
+     * An acceptance payment still in flight blocks a payoff. Paying off an agreement whose deposit
+     * has not cleared would credit ownership to full against an unconfirmed card — the same defect
+     * this whole path exists to close, reached by a different door.
+     */
+    if (agreement.pending_intent_kind === 'acceptance') {
+      throw ConflictError(
+        ERROR_CODES.INVALID_STATE_TRANSITION,
+        'Your first payment is still going through. Once it clears you can pay this off early.',
+      );
+    }
+
     const payoffCents = computePayoff(agreement.cash_price_cents, agreement.ownership_credited_cents ?? 0);
     if (payoffCents <= 0) {
+      // Nothing left to collect — every cent of the cash price is already credited, so ownership
+      // transfers here rather than waiting on a webhook for a charge that will never be opened.
       await this.completeAndTransfer(agreement);
-      return { agreementId, payoffCents: 0, completed: true };
+      return { agreementId, payoffCents: 0, completed: true, clientSecret: null, paymentIntentRef: null };
     }
+
+    /**
+     * ═══ Open the charge. Ownership transfers in the webhook, not here. ═══
+     *
+     * This used to append the payoff to the immutable ledger, credit ownership to the full cash
+     * price, and issue a proof-of-ownership reference — all off a PaymentIntent that had only just
+     * been created and that nobody had confirmed. The customer walked away owning the item outright,
+     * having paid nothing, with a signed record saying they had. Of every place the missing capture
+     * bit, this was the expensive one.
+     *
+     * `creditByPaymentIntent` does all four of those things now, on `payment_intent.succeeded`.
+     */
     const charge = await paymentsService.charge({
       customerId: principal.userId,
       counterpartyType: 'business',
@@ -1226,29 +1275,153 @@ Keep this reference. It is your record that the item is yours.`,
       feeType: 'rto_installment',
       idempotencyKey: `${idempotencyKey}_payoff`,
     });
-    const ledger = await repo.appendLedger({
-      agreement_id: agreementId,
-      entry_type: 'payoff',
-      installment_number: null,
-      amount_cents: payoffCents,
-      fee_cents: charge.platformFeeCents ?? 0,
-      ownership_credit_cents: payoffCents,
-      transaction_id: charge.transactionId,
-      idempotency_key: `rto_payoff_${agreementId}`,
+    await repo.updateAgreement(agreementId, {
+      pending_intent_ref: charge.paymentIntentRef ?? null,
+      pending_intent_kind: 'payoff',
     });
-    if (ledger) {
-      await paymentsService.completeForOrder(charge.transactionId);
-      await repo.updateAgreement(agreementId, {
+    return {
+      agreementId,
+      payoffCents,
+      /**
+       * False, and said plainly. The old `completed: true` was returned before the card had been
+       * seen, so the screen congratulated the customer on owning something they had not bought.
+       */
+      completed: false,
+      clientSecret: charge.clientSecret ?? null,
+      paymentIntentRef: charge.paymentIntentRef ?? null,
+    };
+  },
+
+  /**
+   * ═══ SETTLEMENT. The one place a Rent-to-Own payment becomes real. ═══
+   *
+   * Driven by `payment_intent.succeeded`. Everything that used to happen optimistically at the
+   * moment a charge was OPENED happens here instead, once Stripe says the money exists: the
+   * immutable ledger entry, the ownership credit, the consignment split, and — on a payoff — the
+   * ownership transfer itself.
+   *
+   * Returns `{ handled: false }` for an intent that is not ours, so the webhook's chain of handlers
+   * falls through to the next one exactly as the other modules' credit paths do.
+   */
+  async creditByPaymentIntent(paymentIntentRef: string): Promise<{ handled: boolean }> {
+    const found = await repo.findAgreementByPendingIntent(paymentIntentRef);
+    if (!found) return { handled: false }; // not an RTO payment — let the next handler try
+
+    const agreementId = String(found._id);
+    const kind = found.pending_intent_kind;
+
+    /**
+     * Claim it. Stripe delivers at least once, and crediting twice would hand the customer double
+     * the ownership they paid for; the ledger's unique keys would catch the duplicate entry, but
+     * the ownership write is a `$set` that would happily run again.
+     */
+    const agreement = (await repo.claimPendingIntent(agreementId, paymentIntentRef)) as AgreementDoc | null;
+    if (!agreement) return { handled: true }; // a concurrent delivery won the race
+
+    /**
+     * The fee that was actually taken, read back from the transaction rather than recomputed. A fee
+     * rule can change between opening the charge and the customer confirming their card, and the
+     * ledger must record what Stripe took, not what today's schedule would have taken.
+     */
+    const txn = await paymentsService.findTransactionByPaymentIntent(paymentIntentRef);
+    const transactionId = txn ? String(txn._id) : null;
+    const platformFeeCents = txn?.platform_fee_cents ?? 0;
+
+    if (kind === 'acceptance') {
+      /**
+       * The initial payment and the set-up fee arrived on ONE intent but are TWO ledger entries,
+       * because they are two different kinds of money: the initial payment is 100% equity and the
+       * set-up fee buys the customer nothing. Folding them together would make the set-up fee look
+       * like progress toward ownership.
+       *
+       * The platform fee sits entirely on the initial-payment line — it was levied on that base
+       * alone (the set-up fee rode in as `serviceFeeCents`), so attributing any of it to the set-up
+       * line would misstate both.
+       */
+      const initialCents = agreement.initial_payment_cents ?? 0;
+      const setupCents = agreement.setup_fee_cents ?? 0;
+
+      if (initialCents > 0) {
+        await repo.appendLedger({
+          agreement_id: agreementId,
+          entry_type: 'initial',
+          installment_number: null,
+          amount_cents: initialCents,
+          fee_cents: platformFeeCents,
+          // The initial payment is 100% equity (rto.pricing) — credit equals amount.
+          ownership_credit_cents: initialCents,
+          transaction_id: transactionId,
+          idempotency_key: `rto_initial_${agreementId}`,
+        });
+      }
+      if (setupCents > 0) {
+        await repo.appendLedger({
+          agreement_id: agreementId,
+          entry_type: 'setup_fee',
+          installment_number: null,
+          amount_cents: setupCents,
+          fee_cents: 0,
+          ownership_credit_cents: 0, // a set-up fee is a cost, never equity
+          transaction_id: transactionId,
+          idempotency_key: `rto_setup_${agreementId}`,
+        });
+      }
+
+      const credited = await repo.updateAgreement(agreementId, {
+        ownership_credited_cents: initialCents,
+      });
+      // Split from the CREDITED doc: the consignment split reads the running ownership credit, so
+      // it must see the payment it is dividing, not the state from before it landed.
+      if (initialCents > 0) {
+        await this.recordSplit((credited ?? agreement) as AgreementDoc, null, 'initial', initialCents);
+      }
+    } else if (kind === 'payoff') {
+      const payoffCents = computePayoff(
+        agreement.cash_price_cents,
+        agreement.ownership_credited_cents ?? 0,
+      );
+      await repo.appendLedger({
+        agreement_id: agreementId,
+        entry_type: 'payoff',
+        installment_number: null,
+        amount_cents: payoffCents,
+        fee_cents: platformFeeCents,
+        ownership_credit_cents: payoffCents,
+        transaction_id: transactionId,
+        idempotency_key: `rto_payoff_${agreementId}`,
+      });
+      const credited = await repo.updateAgreement(agreementId, {
         ownership_credited_cents: agreement.cash_price_cents,
       });
+      /**
+       * The payoff was never split. On a consignment agreement that meant the owner was paid their
+       * share of every instalment and nothing at all of the payment that bought the item outright —
+       * and `getStatements` reconciliation reported the shortfall as drift with no explanation.
+       */
+      if (payoffCents > 0) {
+        await this.recordSplit((credited ?? agreement) as AgreementDoc, null, 'payoff', payoffCents);
+      }
       await this.completeAndTransfer({
         _id: agreement._id,
         customer_id: agreement.customer_id,
         product_name: agreement.product_name,
         seller_id: agreement.seller_id,
       });
+    } else {
+      logger.warn({ agreementId, paymentIntentRef }, 'RTO payment settled with no pending kind');
+      return { handled: true };
     }
-    return { agreementId, payoffCents, completed: true };
+
+    // Settle the transaction itself. This handler `break`s the webhook's chain before the generic
+    // fallthrough, so nothing else will do it and the charge would otherwise stay `pending` forever.
+    await paymentsService.completeByPaymentIntent(paymentIntentRef);
+    await writeAudit({
+      action: kind === 'payoff' ? 'rto.payoff_settled' : 'rto.acceptance_settled',
+      entityType: 'rto_agreement',
+      entityId: agreementId,
+      metadata: { paymentIntentRef, transactionId },
+    });
+    return { handled: true };
   },
 
   /** Progress dashboard (U9): next due, balance, made/remaining, ownership %, live payoff amount. */
@@ -1415,15 +1588,20 @@ Keep this reference. It is your record that the item is yours.`,
   },
 
   dashboardFrom(agreement: AgreementDoc, quote: ReturnType<typeof computeRtoQuote>) {
+    /**
+     * Ownership comes from the AGREEMENT, not the quote. The quote says what the initial payment
+     * WOULD credit; the agreement says what has actually been credited, which is nothing until the
+     * card clears. Reading the quote here would put "you own 20%" on the screen at the exact moment
+     * the customer had paid nothing — the same lie the stored field used to tell.
+     */
+    const credited = agreement.ownership_credited_cents ?? 0;
     return {
       ...this.summaryView(agreement),
       nextDueAt: agreement.next_due_at,
       installmentsRemaining: agreement.installment_count,
       ownershipPercent:
-        quote.cashPriceCents > 0
-          ? Math.round((quote.initialOwnershipCreditCents / quote.cashPriceCents) * 100)
-          : 0,
-      payoffCents: computePayoff(quote.cashPriceCents, quote.initialOwnershipCreditCents),
+        quote.cashPriceCents > 0 ? Math.round((credited / quote.cashPriceCents) * 100) : 0,
+      payoffCents: computePayoff(quote.cashPriceCents, credited),
       totalToOwnCents: quote.totalToOwnCents,
       costOverCashCents: quote.costOverCashCents,
     };

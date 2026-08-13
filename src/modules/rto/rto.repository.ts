@@ -166,6 +166,25 @@ export const rtoRepository = {
       .lean()
       .exec();
   },
+  /** The agreement awaiting this PaymentIntent, or null when the intent isn't one of ours. */
+  findAgreementByPendingIntent(paymentIntentRef: string) {
+    return RtoAgreementModel.findOne({ pending_intent_ref: paymentIntentRef }).exec();
+  },
+  /**
+   * Claim a settled payment, exactly once.
+   *
+   * Stripe delivers a webhook AT LEAST once, so two deliveries of the same `payment_intent.succeeded`
+   * would otherwise credit the ownership twice — and on an acceptance that means the customer owns
+   * twice what they paid for. Clearing the ref is the claim: the losing delivery finds nothing
+   * pending and returns without touching the money.
+   */
+  claimPendingIntent(id: string, paymentIntentRef: string) {
+    return RtoAgreementModel.findOneAndUpdate(
+      { _id: id, pending_intent_ref: paymentIntentRef },
+      { $set: { pending_intent_ref: null, pending_intent_kind: null } },
+      { new: true },
+    ).exec();
+  },
   updateAgreement(id: string, patch: Record<string, unknown>) {
     return RtoAgreementModel.findByIdAndUpdate(id, { $set: patch }, { new: true }).exec();
   },

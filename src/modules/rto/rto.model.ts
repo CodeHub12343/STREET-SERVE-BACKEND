@@ -238,6 +238,28 @@ const RtoAgreementSchema = new Schema(
     proof_of_ownership_ref: { type: String, default: null },
 
     /**
+     * ═══ The card payment this agreement is currently waiting on. ═══
+     *
+     * Acceptance and early payoff both used to call `paymentsService.charge()` — which only OPENS a
+     * PaymentIntent — and then immediately `completeForOrder()`, which marks the transaction
+     * `completed`. Nothing ever collected a card. The result was an agreement created with
+     * `ownership_credited_cents` already set, a ledger entry asserting money had moved, a seller
+     * statement crediting the owner their share, and (on payoff) ownership transferred outright —
+     * all against a PaymentIntent sitting at `requires_payment_method`. The customer got equity in a
+     * product for free and the seller was told they had been paid.
+     *
+     * The intent ref is recorded HERE so the webhook can find the agreement the money belongs to,
+     * and `pending_intent_kind` says what settling it should DO — crediting the initial payment and
+     * transferring ownership are very different acts, and the webhook only knows which is owed
+     * because acceptance and payoff each said so when they opened the charge.
+     *
+     * Cleared as the credit is applied, which is also the claim that makes a duplicate webhook a
+     * no-op: the second delivery finds no pending intent and does nothing.
+     */
+    pending_intent_ref: { type: String, default: null, index: true },
+    pending_intent_kind: { type: String, enum: ['acceptance', 'payoff'], default: null },
+
+    /**
      * §50 — the remedies a seller can offer instead of letting an agreement fail.
      *
      * These statuses (`arrangement`, `paused`, `return_pending`, `cancelled`) were declared in the

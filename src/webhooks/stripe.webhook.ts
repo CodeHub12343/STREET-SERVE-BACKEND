@@ -11,6 +11,7 @@ import { pingService } from '../modules/growth/ping.service';
 import { adsService } from '../modules/ads/ads.service';
 import { payforwardService } from '../modules/payforward/payforward.service';
 import { postcardsService } from '../modules/postcards/postcards.service';
+import { rtoService } from '../modules/rto/rto.service';
 import { subscriptionsService } from '../modules/subscriptions/subscriptions.service';
 import { boostService } from '../modules/boost/boost.service';
 import { ERROR_CODES } from '../shared/errors/codes';
@@ -70,6 +71,12 @@ stripeWebhookRouter.post(
         // nowhere else, so the books can never show a sale whose money has not arrived.
         const postcard = await postcardsService.completeByPaymentIntent(String(obj.id));
         if (postcard.handled) break;
+        // A Rent-to-Own acceptance or early payoff. Ownership credit, the immutable ledger entry,
+        // the consignment split and the ownership TRANSFER all happen here and nowhere else — the
+        // accept/payoff endpoints only open the charge, so nobody gains equity in an item against a
+        // card that was never confirmed.
+        const rto = await rtoService.creditByPaymentIntent(String(obj.id));
+        if (rto.handled) break;
         await paymentsService.completeByPaymentIntent(String(obj.id));
         break;
       }

@@ -5,11 +5,12 @@ import { createApp } from '../src/app';
 import { setStripeGateway } from '../src/integrations/stripe';
 import { CategoryModel, CityModel } from '../src/modules/catalog/catalog.model';
 import { setAgreementReviewedForTest } from '../src/modules/agreements/agreements.registry';
-import { ConnectedAccountModel } from '../src/modules/payments/payments.model';
+import { ConnectedAccountModel, TransactionModel } from '../src/modules/payments/payments.model';
 import {
   RtoAgreementModel,
   RtoInstallmentModel,
   RtoLedgerEntryModel,
+  RtoStatementEntryModel,
 } from '../src/modules/rto/rto.model';
 import { rtoService } from '../src/modules/rto/rto.service';
 import { bearer, mintToken, seedUser } from './helpers';
@@ -125,6 +126,24 @@ async function publishListing(
   return res.body.data.id as string;
 }
 
+/**
+ * Confirm the card behind whatever payment an agreement is currently waiting on.
+ *
+ * `POST /rto/agreements` and `POST .../payoff` only OPEN a PaymentIntent. Nothing is credited, no
+ * ledger entry is written and no ownership transfers until Stripe says the money arrived — so any
+ * test that wants the PAID lifecycle has to settle the intent, exactly as a real customer confirming
+ * their card would. A no-op when nothing is pending (a listing with no initial payment and no
+ * set-up fee genuinely owes nothing on day one).
+ */
+async function settlePendingPayment(agreementId: string): Promise<boolean> {
+  const row = await RtoAgreementModel.findById(agreementId).lean();
+  const ref = row?.pending_intent_ref;
+  if (!ref) return false;
+  const res = await stripeEvent('payment_intent.succeeded', { id: ref });
+  expect(res.status).toBe(200);
+  return true;
+}
+
 async function customer(prefix: string): Promise<string> {
   await seedUser({ authProviderId: `${prefix}|cust`, roles: ['customer'] });
   return mintToken(`${prefix}|cust`);
@@ -198,9 +217,9 @@ describe('RTO disclosure + acceptance (R20/R21/R26)', () => {
     expect(res.body.data.disclosure).toMatch(/more than/);
   });
 
-  it('accepts, locks an immutable schedule + ledger, and charges the initial payment', async () => {
+  it('accepts, locks an immutable schedule, and opens ONE charge for the initial payment + set-up fee', async () => {
     const seller = await approvedSeller('rto-accept');
-    const listingId = await publishListing(seller);
+    const listingId = await publishListing(seller, { ...TERMS, setupFeeCents: 500 });
     const token = await customer('rto-accept');
     const res = await request(app)
       .post('/api/v1/rto/agreements')
@@ -209,17 +228,135 @@ describe('RTO disclosure + acceptance (R20/R21/R26)', () => {
       .send({ listingId });
     expect(res.status).toBe(201);
     const agreementId = res.body.data.id as string;
-    // Initial payment is 100% equity: 20% owned up front.
-    expect(res.body.data.ownershipCreditedCents).toBe(2000);
-    expect(res.body.data.ownershipPercent).toBe(20);
     expect(res.body.data.totalToOwnCents).toBe(11000);
+
+    /**
+     * ═══ Nothing is owned yet. This is the whole point. ═══
+     *
+     * Acceptance used to credit the initial payment's equity into the agreement and mark the
+     * transaction complete, having only OPENED a PaymentIntent — so a customer who never entered a
+     * card walked away owning 20% of a laptop. Until the webhook lands, the answer is zero.
+     */
+    expect(res.body.data.ownershipCreditedCents).toBe(0);
+    expect(res.body.data.ownershipPercent).toBe(0);
+
+    // Both amounts due today arrive as ONE intent — one decision, one card form.
+    expect(res.body.data.amountDueNowCents).toBe(2500); // 2000 initial + 500 set-up
+    expect(res.body.data.clientSecret).toEqual(expect.any(String));
 
     const schedule = await RtoInstallmentModel.find({ agreement_id: agreementId }).lean();
     expect(schedule).toHaveLength(4);
     expect(schedule.reduce((s, r) => s + r.ownership_credit_cents, 0)).toBe(8000); // + 2000 initial = cash
 
+    // The ledger is the MONEY record. Nothing may be in it while the card is unconfirmed.
+    expect(await RtoLedgerEntryModel.countDocuments({ agreement_id: agreementId })).toBe(0);
+
+    // ── The card clears. Now, and only now, everything lands. ──
+    expect(await settlePendingPayment(agreementId)).toBe(true);
+
+    const dash = await request(app).get(`/api/v1/rto/agreements/${agreementId}`).set(...bearer(token));
+    expect(dash.body.data.ownershipCreditedCents).toBe(2000);
+    expect(dash.body.data.ownershipPercent).toBe(20);
+
     const ledger = await RtoLedgerEntryModel.find({ agreement_id: agreementId }).lean();
-    expect(ledger.some((l) => l.entry_type === 'initial' && l.amount_cents === 2000)).toBe(true);
+    const initial = ledger.find((l) => l.entry_type === 'initial');
+    const setup = ledger.find((l) => l.entry_type === 'setup_fee');
+    expect(initial!.amount_cents).toBe(2000);
+    expect(initial!.ownership_credit_cents).toBe(2000);
+    expect(initial!.fee_cents).toBe(200); // 10% of the 2000 initial — never of the set-up fee
+    expect(setup!.amount_cents).toBe(500);
+    // A set-up fee is a cost, not progress toward owning the thing.
+    expect(setup!.ownership_credit_cents).toBe(0);
+
+    // Both ledger lines reference the one transaction, and that transaction is now settled.
+    expect(initial!.transaction_id).toBe(setup!.transaction_id);
+    const txn = await TransactionModel.findById(initial!.transaction_id).lean();
+    expect(txn!.status).toBe('completed');
+  });
+
+  /**
+   * ═══ THE REGRESSION. ═══
+   *
+   * `accept` called `paymentsService.charge()` and then `completeForOrder()` on the next line, which
+   * marks a transaction `completed` without anything having been confirmed. Every downstream fact
+   * followed from that lie: ownership credited, an immutable ledger entry asserting money had moved,
+   * a consignment statement crediting the owner their share.
+   *
+   * This test states the invariant directly, so no future shortcut can quietly restore it: with no
+   * webhook, the customer owns NOTHING, the ledger is empty, no transaction is completed, and the
+   * instalment sweep will not bill them either.
+   */
+  it('credits no ownership, and writes no ledger, without a completed transaction', async () => {
+    const seller = await approvedSeller('rto-nopay');
+    const listingId = await publishListing(seller);
+    const token = await customer('rto-nopay');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-nopay-1')
+      .send({ listingId });
+    expect(accept.status).toBe(201);
+    const agreementId = accept.body.data.id as string;
+    // Deliberately no `settlePendingPayment` here — this test IS the unpaid case.
+
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.ownership_credited_cents).toBe(0);
+    expect(row!.pending_intent_kind).toBe('acceptance');
+    expect(await RtoLedgerEntryModel.countDocuments({ agreement_id: agreementId })).toBe(0);
+    // Not one statement line either — an owner must not be credited a share of money never taken.
+    expect(await RtoStatementEntryModel.countDocuments({ agreement_id: agreementId })).toBe(0);
+    expect(
+      await TransactionModel.countDocuments({ customer_id: row!.customer_id, status: 'completed' }),
+    ).toBe(0);
+
+    /**
+     * And the schedule does not start running. Billing instalment #1 against someone whose very
+     * first payment is still unconfirmed would charge them for an agreement they have not entered —
+     * and a decline would drop them into Grace on a schedule that never legitimately began.
+     */
+    await RtoInstallmentModel.updateOne(
+      { agreement_id: agreementId, installment_number: 1 },
+      { $set: { due_at: new Date(Date.now() - 60_000) } },
+    );
+    await rtoService.chargeDueInstallments();
+    const inst = await RtoInstallmentModel.findOne({
+      agreement_id: agreementId,
+      installment_number: 1,
+    }).lean();
+    expect(inst!.status).toBe('scheduled');
+
+    // Early payoff is refused for the same reason — it would credit ownership to FULL on an
+    // unpaid agreement, which is the original defect through a different door.
+    const payoff = await request(app)
+      .post(`/api/v1/rto/agreements/${agreementId}/payoff`)
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-nopay-payoff')
+      .send({});
+    expect(payoff.status).toBe(409);
+  });
+
+  /** A webhook is delivered at least once — twice must not mean twice the equity. */
+  it('credits an acceptance exactly once, however many times Stripe delivers it', async () => {
+    const seller = await approvedSeller('rto-dupe');
+    const listingId = await publishListing(seller);
+    const token = await customer('rto-dupe');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-dupe-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+
+    // Delivered twice, by hand — not via the settle helper, whose whole job is to fire it once.
+    const ref = (await RtoAgreementModel.findById(agreementId).lean())!.pending_intent_ref!;
+    await stripeEvent('payment_intent.succeeded', { id: ref });
+    await stripeEvent('payment_intent.succeeded', { id: ref });
+
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.ownership_credited_cents).toBe(2000); // not 4000
+    expect(
+      await RtoLedgerEntryModel.countDocuments({ agreement_id: agreementId, entry_type: 'initial' }),
+    ).toBe(1);
   });
 });
 
@@ -234,6 +371,7 @@ describe('RTO installments + payoff + completion (R21/R23/R25)', () => {
       .set('Idempotency-Key', 'rto-life-1')
       .send({ listingId });
     const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId); // the deposit clears — the schedule may now run
 
     // Make installment #1 due, then run the charge sweep.
     await RtoInstallmentModel.updateOne(
@@ -254,7 +392,11 @@ describe('RTO installments + payoff + completion (R21/R23/R25)', () => {
     const ledgerInst = await RtoLedgerEntryModel.findOne({ agreement_id: agreementId, entry_type: 'installment' }).lean();
     expect(ledgerInst!.fee_cents).toBe(225); // 10% of the 2250 installment
 
-    // Early payoff (R23) using the locked formula → completes + transfers ownership (R25).
+    /**
+     * Early payoff (R23) using the locked formula. It OPENS a charge and hands back a secret —
+     * `completed` is false, because ownership has not transferred and saying it had is precisely
+     * what this path used to do while nobody had paid.
+     */
     const payoff = await request(app)
       .post(`/api/v1/rto/agreements/${agreementId}/payoff`)
       .set(...bearer(token))
@@ -262,6 +404,20 @@ describe('RTO installments + payoff + completion (R21/R23/R25)', () => {
       .send({});
     expect(payoff.status).toBe(200);
     expect(payoff.body.data.payoffCents).toBe(6000);
+    expect(payoff.body.data.completed).toBe(false);
+    expect(payoff.body.data.clientSecret).toEqual(expect.any(String));
+
+    // Still theirs to finish paying: no proof of ownership issued against an unconfirmed card.
+    const midway = await request(app).get(`/api/v1/rto/agreements/${agreementId}`).set(...bearer(token));
+    expect(midway.body.data.status).not.toBe('completed');
+    expect(midway.body.data.proofOfOwnership).toBeNull();
+
+    // ── The card clears → ownership transfers (R25). ──
+    expect(await settlePendingPayment(agreementId)).toBe(true);
+    expect(
+      (await RtoLedgerEntryModel.findOne({ agreement_id: agreementId, entry_type: 'payoff' }).lean())!
+        .amount_cents,
+    ).toBe(6000);
 
     const dash2 = await request(app).get(`/api/v1/rto/agreements/${agreementId}`).set(...bearer(token));
     expect(dash2.body.data.status).toBe('completed');
@@ -280,6 +436,7 @@ describe('RTO installments + payoff + completion (R21/R23/R25)', () => {
       .set('Idempotency-Key', 'rto-miss-1')
       .send({ listingId });
     const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId); // the deposit clears — the schedule may now run
 
     // Disable the seller's account so the installment charge fails.
     await ConnectedAccountModel.updateOne({ stripe_account_id: stripeAccountId }, { $set: { charges_enabled: false } });
@@ -323,6 +480,7 @@ describe('RTO installments + payoff + completion (R21/R23/R25)', () => {
       .set('Idempotency-Key', 'rto-latefee-1')
       .send({ listingId });
     const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId); // the deposit clears — the schedule may now run
 
     await ConnectedAccountModel.updateOne(
       { stripe_account_id: stripeAccountId },
@@ -369,6 +527,7 @@ describe('RTO installments + payoff + completion (R21/R23/R25)', () => {
       .set('Idempotency-Key', 'rto-nolatefee-1')
       .send({ listingId });
     const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId); // the deposit clears — the schedule may now run
 
     await ConnectedAccountModel.updateOne(
       { stripe_account_id: seller.stripeAccountId },
@@ -409,6 +568,7 @@ describe('Consignment Rent-to-Own — 3-party split + statements (R19/B4)', () =
       .send({ listingId });
     expect(accept.status).toBe(201);
     const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId); // the deposit clears — the schedule may now run
 
     // Charge installment #1 ($100 gross).
     await RtoInstallmentModel.updateOne(
@@ -786,7 +946,11 @@ describe('RTO seller remedies (§50)', () => {
       .set('Idempotency-Key', `${prefix}-1`)
       .send({ listingId });
     expect(accept.status).toBe(201);
-    return { seller, token, agreementId: accept.body.data.id as string };
+    const agreementId = accept.body.data.id as string;
+    // The deposit clears. Without it nothing is credited and the sweep will not bill at all, so
+    // every test below would be exercising an agreement that never actually started.
+    await settlePendingPayment(agreementId);
+    return { seller, token, agreementId };
   }
 
   it('gives more time: pushes the due date and clears the late status', async () => {
@@ -903,7 +1067,11 @@ describe('RTO voluntary return (§51)', () => {
       .set('Idempotency-Key', `${prefix}-1`)
       .send({ listingId });
     expect(accept.status).toBe(201);
-    return { seller, token, agreementId: accept.body.data.id as string };
+    const agreementId = accept.body.data.id as string;
+    // The deposit clears. Without it nothing is credited and the sweep will not bill at all, so
+    // every test below would be exercising an agreement that never actually started.
+    await settlePendingPayment(agreementId);
+    return { seller, token, agreementId };
   }
 
   it('refuses a customer return when the agreement never offered one', async () => {

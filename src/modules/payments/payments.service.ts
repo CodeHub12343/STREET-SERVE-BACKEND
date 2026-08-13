@@ -274,6 +274,19 @@ export const paymentsService = {
     };
   },
 
+  /**
+   * The transaction behind a PaymentIntent, for callers settling their own domain off the webhook.
+   *
+   * A module crediting on `payment_intent.succeeded` needs two facts this row already holds — the
+   * transaction id to reference from its own ledger, and the platform fee that was actually taken —
+   * and neither is available from the Stripe event. Reading them back is strictly better than
+   * re-deriving the fee at settle time, which would silently drift the moment a fee rule changed
+   * between the charge and the card being confirmed.
+   */
+  findTransactionByPaymentIntent(paymentIntentRef: string) {
+    return repo.findTransactionByPaymentIntent(paymentIntentRef);
+  },
+
   /** Webhook-driven completion: pending → completed (immutable thereafter). */
   async completeByPaymentIntent(paymentIntentRef: string) {
     const txn = await repo.completePendingByPaymentIntent(paymentIntentRef);
