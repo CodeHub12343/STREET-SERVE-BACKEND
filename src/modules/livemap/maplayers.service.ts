@@ -295,10 +295,25 @@ export const mapLayersService = {
 
     const sellerIds = [...new Set(checkouts.map((c) => c.seller_id))];
     const [sessions, products, users] = await Promise.all([
+      /**
+       * ═══ ENDED sessions count too. ═══
+       *
+       * This filtered on `ended_at: null`, so the only sellers with a location were those live at
+       * the instant the hub owner opened the screen. Every other holder came back as "we don't know
+       * where this is" — including a seller who was pinned two streets away an hour ago, whose last
+       * position we had the whole time and threw away. Between shifts (which is most of the day)
+       * that made the map permanently empty and the screen useless: a hub owner chasing stock was
+       * told nothing, when we could have told them where it was last seen.
+       *
+       * So: the most recent session per seller, live or not, ordered by `last_ping_at`. The record
+       * says WHICH it is (`locationAge`) and the client renders a stale fix differently and dates it
+       * — a last-known position presented as a current one would be worse than no position at all.
+       */
       LiveSessionModel.find(
-        { actor_type: 'seller', actor_id: { $in: sellerIds }, ended_at: null },
-        { actor_id: 1, current_location: 1, status: 1, last_ping_at: 1 },
+        { actor_type: 'seller', actor_id: { $in: sellerIds } },
+        { actor_id: 1, current_location: 1, status: 1, last_ping_at: 1, ended_at: 1 },
       )
+        .sort({ last_ping_at: -1 })
         .lean()
         .exec(),
       ProductModel.find(
@@ -309,22 +324,51 @@ export const mapLayersService = {
         .exec(),
       (async () => {
         const { UserModel } = await import('../identity/identity.model');
-        return UserModel.find({ _id: { $in: sellerIds } }, { display_name: 1 }).lean().exec();
+        /**
+         * Email and phone are read as NAME FALLBACKS, not for contact. `display_name` is nullable
+         * and is only ever populated from the auth provider, so a seller who signed up without one
+         * rendered as the literal string "Seller" — and a hub owner looking at two such rows saw
+         * "Seller" twice, unable to tell which of two people held which stock. That is a failure of
+         * the screen's entire purpose, and it is worse than an ugly name.
+         */
+        return UserModel.find(
+          { _id: { $in: sellerIds } },
+          { display_name: 1, email: 1, phone: 1 },
+        )
+          .lean()
+          .exec();
       })(),
     ]);
 
-    const sessionBySeller = new Map(sessions.map((s) => [s.actor_id, s]));
+    /**
+     * First write wins: the find above is sorted newest-first, so the first session seen for a
+     * seller is their most recent one.
+     */
+    const sessionBySeller = new Map<string, (typeof sessions)[number]>();
+    for (const s of sessions) if (!sessionBySeller.has(s.actor_id)) sessionBySeller.set(s.actor_id, s);
     const productName = new Map(products.map((p) => [String(p._id), p.name]));
-    const displayName = new Map(users.map((u) => [String(u._id), u.display_name]));
+    const userById = new Map(users.map((u) => [String(u._id), u]));
+
+    /** A name a human can tell apart from the next one, from whatever the record actually holds. */
+    const sellerNameFor = (sellerId: string): string => {
+      const u = userById.get(sellerId);
+      if (u?.display_name) return u.display_name;
+      // An email's local part is a real, distinguishing handle; the domain is noise here.
+      if (u?.email) return u.email.split('@')[0]!;
+      if (u?.phone) return u.phone;
+      // Last resort still distinguishes two sellers, which the bare "Seller" did not.
+      return `Seller ${sellerId.slice(-4)}`;
+    };
 
     const holders = checkouts.map((c) => {
       const session = sessionBySeller.get(c.seller_id);
       const coords = session?.current_location?.coordinates as [number, number] | undefined;
+      const lngLat = coords && coords.length === 2 ? coords : null;
       const outstanding = c.quantity - (c.quantity_sold ?? 0);
       return {
         checkoutId: String(c._id),
         sellerId: c.seller_id,
-        sellerName: displayName.get(c.seller_id) ?? 'Seller',
+        sellerName: sellerNameFor(c.seller_id),
         productName: productName.get(String(c.product_id)) ?? 'Item',
         quantity: c.quantity,
         quantitySold: c.quantity_sold ?? 0,
@@ -332,17 +376,25 @@ export const mapLayersService = {
         valueCents: outstanding * (c.unit_value_cents ?? 0),
         status: c.status,
         expectedReturnAt: c.expected_return_at,
-        /** Null when the seller has no live session — the rows worth chasing. */
-        lngLat: coords && coords.length === 2 ? coords : null,
+        /** Null only when this seller has NEVER been live — the rows genuinely worth chasing. */
+        lngLat,
+        /**
+         * How much to trust the pin. `live` is a session still running; `last_known` is where they
+         * were when they last pinged, which the client must date rather than present as current.
+         */
+        locationAge: lngLat ? (session?.ended_at ? ('last_known' as const) : ('live' as const)) : null,
         lastSeenAt: session?.last_ping_at ?? null,
-        liveStatus: session?.status ?? null,
+        liveStatus: session?.ended_at ? null : (session?.status ?? null),
       };
     });
 
     return {
       hubId,
       holders,
+      /** Anything with a pin on the map, live or stale — this is the map's own count. */
       locatedCount: holders.filter((h) => h.lngLat !== null).length,
+      /** Of those, the ones we can vouch for right now. Reported separately so the UI can be honest. */
+      liveCount: holders.filter((h) => h.locationAge === 'live').length,
     };
   },
 };
