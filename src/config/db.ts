@@ -24,6 +24,19 @@ export async function connectMongo(uri: string = env.MONGODB_URI): Promise<typeo
     writeConcern: { w: 'majority' },
     serverSelectionTimeoutMS: 10_000,
     maxPoolSize: 20,
+    /**
+     * Indexes are migrations, not a boot side effect (DEPLOYMENT_STRATEGY.md §7: "never implicit
+     * runtime ensureIndex in prod").
+     *
+     * Mongoose defaults `autoIndex` to true, so the first deployed boot built every schema index
+     * under Mongoose's own default names — and then `migrate-mongo up` could not create the same
+     * index under its intended name, failing with "Index already exists with a different name:
+     * authProviderId_1". The app had raced its own migrations and won.
+     *
+     * Left on for test and development, where no migration runs and the suite depends on unique
+     * constraints existing. Off everywhere deployed, so `migrate-mongo` is the single writer.
+     */
+    autoIndex: env.NODE_ENV === 'test' || env.NODE_ENV === 'development',
   });
   connected = true;
   logger.info('mongo connected');
