@@ -697,6 +697,7 @@ export const ordersService = {
     round_up_cents?: number | null;
     total_cents: number;
     transaction_id?: string | null;
+    fulfillment_type?: string | null;
     created_at?: Date;
   }) {
     // Full server-authoritative breakdown (R9) — the receipt/preview render these values directly.
@@ -729,6 +730,15 @@ export const ordersService = {
       totalCents: o.total_cents,
       breakdown,
       transactionId: o.transaction_id ?? null,
+      /**
+       * Exposed so a client can tell a collection from a delivery.
+       *
+       * Without it the vendor board offered "Need delivery? Ask driver" on every ticket, including
+       * `pickup_now` orders that delivery.service.ts refuses outright with "This order is not a
+       * delivery". The UI cannot avoid offering an impossible action if the read model never says
+       * which kind of order it is.
+       */
+      fulfillmentType: o.fulfillment_type ?? 'pickup_now',
       createdAt: o.created_at ?? null,
     };
   },
