@@ -369,6 +369,36 @@ describe('BP-3: registration persists what it asks for', () => {
     expect(read.body.data.travelFeeCents).toBe(1500);
   });
 
+  /**
+   * The settings screen seeds its form from GET and sends the result back. `hours` is an array of
+   * subdocuments, so Mongoose stamped each entry with an `_id` and the read model passed it
+   * through — which the `.strict()` update schema then rejected. Every attempt to save business
+   * settings failed with 400 "Unrecognized key(s) in object: '_id'".
+   *
+   * The round-trip test above missed it because `toMatchObject` ignores extra keys. This asserts the
+   * exact keys, and then performs the round trip the UI actually performs.
+   */
+  it('returns hours with no internal ids, so a client can save back what it was given', async () => {
+    const ownerId = await seedUser({ authProviderId: 'bp3|echo', roles: ['vendor'] });
+    const token = await mintToken('bp3|echo');
+    const { businessId } = await makeBusiness({ archetype: 'on_demand_service', ownerId });
+
+    await request(app)
+      .patch(`/api/v1/businesses/${businessId}`)
+      .set(...bearer(token))
+      .send({ hours: [{ day: 1, open: '09:00', close: '17:00' }] });
+
+    const read = await request(app).get(`/api/v1/businesses/${businessId}`);
+    expect(Object.keys(read.body.data.hours[0]).sort()).toEqual(['close', 'day', 'open']);
+
+    // Exactly what the settings screen does: hand the server its own response back.
+    const resave = await request(app)
+      .patch(`/api/v1/businesses/${businessId}`)
+      .set(...bearer(token))
+      .send({ name: 'Spicy & Crispy', hours: read.body.data.hours });
+    expect(resave.status).toBe(200);
+  });
+
   it('rejects hours whose close is not after open', async () => {
     const ownerId = await seedUser({ authProviderId: 'bp3|badhours', roles: ['vendor'] });
     const token = await mintToken('bp3|badhours');

@@ -95,7 +95,19 @@ export const vendorsService = {
       description: b.description,
       logoUrl: b.logo_url,
       coverPhotoUrl: b.cover_photo_url,
-      hours: b.hours,
+      /**
+       * Mapped field-by-field rather than passed through.
+       *
+       * `hours` is an array of subdocuments, so Mongoose stamps each entry with its own `_id`.
+       * Returning them raw put that `_id` in the API response, and the settings screen sends the
+       * hours it was given straight back — into `UpdateBusinessBody`, which is `.strict()`. Saving
+       * business settings therefore always failed with 400 "Unrecognized key(s) in object: '_id'",
+       * and the id served no purpose to any client in the first place.
+       *
+       * The model no longer generates these ids, but existing rows still carry them, so the
+       * projection stays explicit rather than relying on the schema change alone.
+       */
+      hours: (b.hours ?? []).map((h) => ({ day: h.day, open: h.open, close: h.close })),
       todaySpecialMenuItemId: b.today_special_menu_item_id
         ? String(b.today_special_menu_item_id)
         : null,

@@ -7,6 +7,12 @@ import { defineModel } from '../../shared/defineModel';
  * Phase 2; Phase 1 covers business CRUD, menus, category suggestions, and license gating.
  */
 
+/** One weekly opening-hours entry. `day` is 0=Sun..6=Sat; times are "HH:MM" 24h. */
+const HoursSchema = new Schema(
+  { day: Number, open: String, close: String },
+  { _id: false },
+);
+
 // ─── businesses ────────────────────────────────────────────────────────────────────────────
 const BusinessSchema = new Schema(
   {
@@ -23,7 +29,12 @@ const BusinessSchema = new Schema(
     description: { type: String, default: null },
     logo_url: { type: String, default: null }, // customer-facing map pin icon
     cover_photo_url: { type: String, default: null },
-    hours: { type: [{ day: Number, open: String, close: String }], default: [] },
+    /**
+     * `_id: false` — an opening-hours entry is a value, not an entity: nothing references one, and
+     * the whole array is replaced on every update. The generated id was pure noise that leaked into
+     * the API response and then broke the strict update schema when a client echoed it back.
+     */
+    hours: { type: [HoursSchema], default: [] },
     today_special_menu_item_id: { type: Schema.Types.ObjectId, ref: 'MenuItem', default: null },
     service_area: {
       type: { type: String, enum: ['Point'], default: undefined },
