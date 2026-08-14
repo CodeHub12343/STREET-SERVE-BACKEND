@@ -1,0 +1,14 @@
+node_modules
+dist
+coverage
+.git
+.github
+*.md
+test
+scripts
+.env*
+docker-compose.yml
+Dockerfile
+.eslintrc.cjs
+.prettierrc.json
+*.tsbuildinfo

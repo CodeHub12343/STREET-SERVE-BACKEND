@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      # Integration tests boot an in-memory Mongo replica set (transactions) — no external services.
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      # 6.1: production dependencies only, with reviewed exceptions that EXPIRE
+      # (SECURITY_GUIDELINES.md §4). The previous `npm audit --audit-level=high` audited the whole
+      # tree, so a vitest or vite advisory — build-time only, never shipped — would fail a deploy.
+      # A gate people learn to skip is not a gate.
+      - name: Dependency CVE gate
+        run: npm run audit:deps

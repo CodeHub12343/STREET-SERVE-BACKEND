@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "../STREET-SERVE-APPLICATION"
+		},
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"liveServer.settings.multiRootWorkspaceName": "STREET-SERVE-APPLICATION"
+	}
+}

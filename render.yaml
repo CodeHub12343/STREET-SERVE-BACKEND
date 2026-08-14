@@ -1,0 +1,261 @@
+# StreetServe — Render blueprint (staging)
+#
+# Two services from ONE image, per DEPLOYMENT_STRATEGY.md §2: the API holds HTTP + Socket.IO,
+# the worker drains BullMQ. They scale on different signals, so they are separate services even
+# though the Dockerfile is shared — the worker just overrides the start command.
+#
+# Every secret is `sync: false`: Render prompts for it once in the dashboard and stores it in its
+# own secret store. Nothing here carries a credential, which is what makes this file committable.
+#
+# First deploy order matters: create the databases, fill the env vars, THEN run
+# `npm run migrate:up` against Atlas (Render Shell or locally) before the app takes traffic.
+# Migrations create the indexes the geospatial and money queries assume exist.
+
+services:
+  # ─── API: HTTP + Socket.IO ──────────────────────────────────────────────────
+  - type: web
+    name: streetserve-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    healthCheckPath: /readyz
+    # Deliberately 1 on staging. Socket.IO's polling handshake needs session affinity, and Render
+    # does not offer sticky sessions — a second instance would break long-polling upgrades. The
+    # Redis adapter handles cross-instance *broadcast*, not handshake affinity. Scaling past 1
+    # requires forcing `transports: ['websocket']` first.
+    numInstances: 1
+    envVars:
+      # NODE_ENV=staging, not production: it keeps the Stripe-webhook check at a warning instead of
+      # a fatal, so a half-configured staging box still boots and can be debugged. Flip to
+      # production only with a real whsec_ in hand.
+      - key: NODE_ENV
+        value: staging
+      - key: LOG_LEVEL
+        value: info
+      # Render injects PORT and expects the process to bind it. src/config/env.ts already reads it.
+      - key: PORT
+        value: 8080
+
+      # ─── Datastores ─────────────────────────────────────────────────────────
+      # Atlas MUST be a replica set — the settlement paths use multi-document transactions and
+      # fail outright against a standalone mongod.
+      - key: MONGODB_URI
+        sync: false
+      - key: REDIS_URL
+        sync: false
+
+      # ─── Auth (Clerk) ───────────────────────────────────────────────────────
+      # Boot refuses to start without all three of JWKS/ISSUER/AUDIENCE outside test.
+      - key: AUTH_PROVIDER
+        value: clerk
+      - key: AUTH_JWKS_URL
+        sync: false
+      - key: AUTH_ISSUER
+        sync: false
+      - key: AUTH_AUDIENCE
+        value: streetserve-api
+      - key: AUTH_WEBHOOK_SECRET
+        sync: false
+
+      # ─── CORS ───────────────────────────────────────────────────────────────
+      # The Vercel frontend origin. A missing entry here rejects every browser call with an
+      # opaque CORS error rather than a useful one, so set it before first smoke test.
+      - key: CORS_ORIGINS
+        sync: false
+
+      # ─── Payments (Stripe TEST mode on staging) ─────────────────────────────
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      # From `stripe webhooks` pointed at https://<api-host>/webhooks/stripe. Card payments are
+      # confirmed ONLY by this webhook — without a valid secret, customers are charged and orders
+      # never leave "waiting for payment".
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_CONNECT_COUNTRY
+        value: US
+      - key: PLATFORM_CURRENCY
+        value: usd
+      - key: STRIPE_TAX_ENABLED
+        value: 'false'
+
+      # Customer-facing fee flags — OFF at launch by decision, not by oversight (env.ts §R8/R10).
+      # The plumbing is complete; these decide whether the customer is actually charged.
+      - key: CUSTOMER_SERVICE_FEE_ENABLED
+        value: 'false'
+      - key: PROCESSING_FEE_ENABLED
+        value: 'false'
+      - key: WAVE_CONVENIENCE_FEE_ENABLED
+        value: 'false'
+
+      # ─── KYC ────────────────────────────────────────────────────────────────
+      - key: KYC_PROVIDER
+        value: stripe_identity
+      - key: KYC_WEBHOOK_SECRET
+        sync: false
+      # Never true on a shared environment: it hands out verified status without a real ID check.
+      - key: KYC_DEV_AUTO_APPROVE
+        value: 'false'
+
+      # ─── Public URLs (all point at the Vercel frontend) ──────────────────────
+      - key: APP_BASE_URL
+        sync: false
+      - key: KYC_RETURN_URL
+        sync: false
+      - key: CONNECT_RETURN_URL
+        sync: false
+      - key: CONNECT_REFRESH_URL
+        sync: false
+
+      # ─── Object storage (Cloudflare R2) ─────────────────────────────────────
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        value: streetserve-media
+      - key: R2_PUBLIC_BASE_URL
+        sync: false
+      - key: R2_REGION
+        value: auto
+
+      # ─── AI (optional everywhere) ───────────────────────────────────────────
+      # With no key the deterministic rule-based engine runs, which is a complete implementation.
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: GEMINI_FAST_MODEL
+        value: gemini-2.5-flash-lite
+      - key: GEMINI_TIMEOUT_MS
+        value: '6000'
+
+      # ─── Print vendor (PostcardMania) ───────────────────────────────────────
+      # SANDBOX only here. Boot refuses to start if this says production while NODE_ENV does not,
+      # because a live print run mails real paper at real cost and cannot be rolled back.
+      - key: PCM_ENVIRONMENT
+        value: sandbox
+      - key: PCM_API_KEY
+        sync: false
+      - key: PCM_API_SECRET
+        sync: false
+
+      # ─── Platform ───────────────────────────────────────────────────────────
+      - key: RATE_LIMIT_ENABLED
+        value: 'true'
+      - key: METRICS_ENABLED
+        value: 'true'
+      - key: OPENAPI_ENABLED
+        value: 'true'
+      - key: DEFAULT_CITY
+        value: modesto-ca
+
+  # ─── Worker: BullMQ queues, sweeps, retention jobs ──────────────────────────
+  # Same image, different entrypoint. It needs the same datastore + vendor config as the API
+  # because the jobs it runs touch settlement, storage and the print queue.
+  - type: worker
+    name: streetserve-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: node dist/worker.js
+    plan: starter
+    region: oregon
+    envVars:
+      - key: NODE_ENV
+        value: staging
+      - key: LOG_LEVEL
+        value: info
+      # Pulled from the API service so the two can never drift onto different databases —
+      # a worker writing to a different Mongo than the API reads is a silent, ugly failure.
+      - key: MONGODB_URI
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: MONGODB_URI
+      - key: REDIS_URL
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: REDIS_URL
+      - key: AUTH_PROVIDER
+        value: clerk
+      - key: AUTH_JWKS_URL
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: AUTH_JWKS_URL
+      - key: AUTH_ISSUER
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: AUTH_ISSUER
+      - key: AUTH_AUDIENCE
+        value: streetserve-api
+      - key: STRIPE_SECRET_KEY
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: STRIPE_SECRET_KEY
+      - key: STRIPE_WEBHOOK_SECRET
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: STRIPE_WEBHOOK_SECRET
+      - key: APP_BASE_URL
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: APP_BASE_URL
+      - key: R2_ENDPOINT
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: R2_ENDPOINT
+      - key: R2_ACCESS_KEY_ID
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: R2_ACCESS_KEY_ID
+      - key: R2_SECRET_ACCESS_KEY
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: R2_SECRET_ACCESS_KEY
+      - key: R2_BUCKET
+        value: streetserve-media
+      - key: R2_PUBLIC_BASE_URL
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: R2_PUBLIC_BASE_URL
+      - key: R2_REGION
+        value: auto
+      - key: AI_PROVIDER
+        value: gemini
+      - key: GEMINI_API_KEY
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: GEMINI_API_KEY
+      - key: PCM_ENVIRONMENT
+        value: sandbox
+      - key: PCM_API_KEY
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: PCM_API_KEY
+      - key: PCM_API_SECRET
+        fromService:
+          name: streetserve-api
+          type: web
+          envVarKey: PCM_API_SECRET
+      - key: METRICS_ENABLED
+        value: 'true'
+      - key: DEFAULT_CITY
+        value: modesto-ca

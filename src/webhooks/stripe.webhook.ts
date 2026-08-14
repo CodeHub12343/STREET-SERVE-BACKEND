@@ -1,0 +1,129 @@
+import express, { Router, type Request, type Response } from 'express';
+
+import { env } from '../config/env';
+import { logger } from '../config/logger';
+import { asyncHandler } from '../middleware/asyncHandler';
+import { stripe } from '../integrations/stripe';
+import { verificationService } from '../modules/identity/verification.service';
+import { paymentsService } from '../modules/payments/payments.service';
+import { salePaymentsService } from '../modules/salepayments/salepayments.service';
+import { pingService } from '../modules/growth/ping.service';
+import { adsService } from '../modules/ads/ads.service';
+import { payforwardService } from '../modules/payforward/payforward.service';
+import { postcardsService } from '../modules/postcards/postcards.service';
+import { boostService } from '../modules/boost/boost.service';
+import { ERROR_CODES } from '../shared/errors/codes';
+import { ForbiddenError, ValidationError } from '../shared/errors/AppError';
+import { ok } from '../shared/respond';
+
+/**
+ * Stripe webhook ingestion — signature-verified on the RAW body, deduped and processed
+ * idempotently. Handles payments (PaymentIntent lifecycle, account updates) and Stripe Identity
+ * KYC events. See THIRD_PARTY_INTEGRATIONS.md §4/§9.
+ */
+export const stripeWebhookRouter = Router();
+
+stripeWebhookRouter.post(
+  '/stripe',
+  express.raw({ type: '*/*', limit: '1mb' }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const signature = req.header('stripe-signature');
+    if (!env.STRIPE_WEBHOOK_SECRET) throw ValidationError('Stripe webhook secret not configured');
+    if (!signature)
+      throw ForbiddenError('Missing signature', ERROR_CODES.WEBHOOK_SIGNATURE_INVALID);
+
+    let event;
+    try {
+      event = stripe().constructWebhookEvent(
+        req.body as Buffer,
+        signature,
+        env.STRIPE_WEBHOOK_SECRET,
+      );
+    } catch {
+      throw ForbiddenError('Invalid webhook signature', ERROR_CODES.WEBHOOK_SIGNATURE_INVALID);
+    }
+
+    const obj = event.data.object;
+    switch (event.type) {
+      case 'payment_intent.succeeded': {
+        // A consignment sale payment is a separate-charges intent owned by the sale-payments
+        // module; anything else is an ordinary order charge. Try the consignment path first and
+        // fall through when the intent isn't one of ours.
+        const handled = await salePaymentsService.onPaymentSucceeded(String(obj.id));
+        if (handled.handled) break;
+        // A vendor's ping-budget prepayment — credits the budget only now that the money exists.
+        const topup = await pingService.creditTopup(String(obj.id));
+        if (topup.handled) break;
+        // A paid placement — starts delivering only now that it has been paid for.
+        const placement = await adsService.activateByPaymentIntent(String(obj.id));
+        if (placement.handled) break;
+        // A Pay It Forward contribution — the pool is credited HERE and nowhere else, so a balance
+        // can never rise against money that has not arrived (ADR-005; the PingBudgetTopup lesson).
+        const contribution = await payforwardService.creditContribution(String(obj.id));
+        if (contribution.handled) break;
+        // A Boost campaign contribution — captured on contribution (ADR-006), credited to the
+        // campaign's own escrow account only once the money has actually arrived.
+        const boost = await boostService.creditContribution(String(obj.id));
+        if (boost.handled) break;
+        // A postcard order (ADR-007). Books the capture and accrues the vendor debt HERE and
+        // nowhere else, so the books can never show a sale whose money has not arrived.
+        const postcard = await postcardsService.completeByPaymentIntent(String(obj.id));
+        if (postcard.handled) break;
+        await paymentsService.completeByPaymentIntent(String(obj.id));
+        break;
+      }
+      case 'payment_intent.payment_failed': {
+        const reason =
+          (obj.last_payment_error as { message?: string } | undefined)?.message ?? 'payment_failed';
+        const handled = await salePaymentsService.onPaymentFailed(String(obj.id), reason);
+        if (handled.handled) break;
+        // A contribution left at `pending` forever is indistinguishable from one still in flight.
+        const failedContribution = await payforwardService.failContribution(String(obj.id), reason);
+        if (failedContribution.handled) break;
+        const failedBoost = await boostService.failContribution(String(obj.id), reason);
+        if (failedBoost.handled) break;
+        const failedPostcard = await postcardsService.failByPaymentIntent(String(obj.id), reason);
+        if (failedPostcard.handled) break;
+        await paymentsService.failByPaymentIntent(String(obj.id));
+        break;
+      }
+      /**
+       * A customer disputed the card charge. Freeze the seller's payouts immediately: money that
+       * leaves now is effectively unrecoverable, and the platform is liable for the chargeback as
+       * merchant of record.
+       */
+      case 'charge.dispute.created': {
+        await salePaymentsService.onChargeDisputed(
+          String(obj.payment_intent ?? ''),
+          String(obj.reason ?? 'chargeback'),
+        );
+        break;
+      }
+      case 'charge.dispute.closed': {
+        await salePaymentsService.onChargeDisputeClosed(
+          String(obj.payment_intent ?? ''),
+          String(obj.status ?? 'lost'),
+        );
+        break;
+      }
+      case 'account.updated': {
+        const account = await paymentsService.refreshAccountStatus(String(obj.id));
+        if (account?.payouts_enabled) {
+          await verificationService.onPayoutsEnabled(account.owner_type, account.owner_id);
+        }
+        break;
+      }
+      case 'identity.verification_session.verified':
+        await verificationService.applyKycResult(String(obj.id), 'approved');
+        break;
+      case 'identity.verification_session.requires_input':
+      case 'identity.verification_session.canceled':
+        await verificationService.applyKycResult(String(obj.id), 'rejected');
+        break;
+      default:
+        logger.debug({ type: event.type }, 'unhandled stripe event');
+    }
+
+    ok(res, { received: true, type: event.type });
+  }),
+);
