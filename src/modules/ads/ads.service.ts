@@ -291,6 +291,26 @@ export const adsService = {
       ownerType = 'business';
       ownerId = input.businessId;
     }
+
+    /**
+     * An ad with nowhere to go cannot be worth buying.
+     *
+     * `serve()` falls back to `/business/<id>` when `click_url` is absent — but ONLY for a
+     * business-owned placement. A user-owned ad with no link resolves to `clickUrl: null`, and
+     * AdSlot deliberately renders a non-interactive card for that. So a promoter without a business
+     * who left the (optional) link blank paid in full, had impressions served, and shipped an advert
+     * nobody could click: a structurally zero click-through that nothing surfaced until they read
+     * their own analytics.
+     *
+     * Refused here rather than only in the form, because the form is not the only way in and this
+     * one costs the buyer real money.
+     */
+    if (ownerType === 'user' && !input.clickUrl) {
+      throw ValidationError(
+        'Add a link for this promotion. Without a business profile to send people to, an ad with no link cannot be clicked.',
+      );
+    }
+
     const purchase = resolvePurchase(input);
 
     const doc = await PlacementModel.create({

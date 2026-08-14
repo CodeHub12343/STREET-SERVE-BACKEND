@@ -208,6 +208,60 @@ describe('F-3: ad inventory', () => {
     }
   });
 
+  /**
+   * `serve()` only falls back to `/business/<id>` for a BUSINESS-owned placement. A user-owned ad
+   * with no link resolves to `clickUrl: null`, which AdSlot renders as a non-interactive card — so
+   * the buyer paid in full for an advert nobody could click, and nothing said so.
+   */
+  it('refuses a user-owned ad with no link, since it could never be clicked', async () => {
+    const hub = await makeHub('f3nolink');
+
+    const res = await request(app)
+      .post('/api/v1/placements/campaigns')
+      .set(...bearer(hub.hubToken))
+      .send({
+        placement: 'discovery_card',
+        headline: 'No destination',
+        budgetCents: 50_000,
+        // No businessId → owner_type 'user', and no clickUrl → nowhere to send anyone.
+      });
+
+    expect(res.status).toBe(400);
+    expect(String(res.body.error.message)).toMatch(/link/i);
+  });
+
+  it('accepts a user-owned ad that supplies its own link', async () => {
+    const hub = await makeHub('f3link');
+
+    const res = await request(app)
+      .post('/api/v1/placements/campaigns')
+      .set(...bearer(hub.hubToken))
+      .send({
+        placement: 'discovery_card',
+        headline: 'Has a destination',
+        budgetCents: 50_000,
+        clickUrl: 'https://example.com/shop',
+      });
+
+    expect(res.status).toBe(201);
+  });
+
+  it('still accepts a business-owned ad with no link — it falls back to the profile', async () => {
+    const hub = await makeHub('f3bizlink');
+
+    const res = await request(app)
+      .post('/api/v1/placements/campaigns')
+      .set(...bearer(hub.hubToken))
+      .send({
+        placement: 'discovery_card',
+        headline: 'Falls back to my profile',
+        budgetCents: 50_000,
+        businessId: hub.businessId,
+      });
+
+    expect(res.status).toBe(201);
+  });
+
   it('bills impressions in batches and retires an exhausted campaign', async () => {
     const hub = await makeHub('f3bill');
     const campaign = await request(app)
