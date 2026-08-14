@@ -39,15 +39,40 @@ async function dropIfExists(collection, name) {
 module.exports = {
   async up(db) {
     const transactions = db.collection('transactions');
+    const existing = await transactions.indexes();
+
     for (const { field, oldName } of SPECS) {
-      await transactions.createIndex(
-        { [field]: 1 },
-        {
-          name: `${field}_1_partial`,
-          unique: true,
-          partialFilterExpression: { [field]: { $type: 'string' } },
-        },
-      );
+      /**
+       * The correct partial index may already exist under a different name.
+       *
+       * `20260705000003-phase1-indexes.js` creates exactly this key spec, unique and partial, as
+       * `ux_txn_pi` / `ux_txn_idem`. This migration was written against a database where Mongoose
+       * `autoIndex` had built a SPARSE `payment_intent_ref_1` instead — so it assumed that name and
+       * that shape. MongoDB refuses a second index on the same key under a new name, so on a
+       * properly migration-built database it aborted with:
+       *
+       *     Index already exists with a different name: ux_txn_pi
+       *
+       * Matching on the key spec rather than on a name makes this correct in both histories, and
+       * idempotent on re-run.
+       */
+      const onField = existing.filter((i) => {
+        const keys = Object.keys(i.key ?? {});
+        return keys.length === 1 && keys[0] === field;
+      });
+      const alreadyCorrect = onField.find((i) => i.unique && i.partialFilterExpression);
+
+      if (!alreadyCorrect) {
+        await transactions.createIndex(
+          { [field]: 1 },
+          {
+            name: `${field}_1_partial`,
+            unique: true,
+            partialFilterExpression: { [field]: { $type: 'string' } },
+          },
+        );
+      }
+      // Runs either way: the legacy sparse index is what this migration exists to remove.
       await dropIfExists(transactions, oldName);
     }
   },
