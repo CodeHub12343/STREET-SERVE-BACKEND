@@ -1,6 +1,6 @@
 import pino from 'pino';
 
-import { env, isProd, isTest } from './env';
+import { env, isTest } from './env';
 
 /**
  * Structured JSON logger. No `console.*` anywhere else in app code (lint-enforced).
@@ -54,12 +54,27 @@ export const logger = pino({
     censor: '[REDACTED]',
   },
   base: { service: 'streetserve-backend' },
-  transport: isProd
-    ? undefined
-    : {
-        target: 'pino-pretty',
-        options: { colorize: true, translateTime: 'SYS:HH:MM:ss', ignore: 'pid,hostname,service' },
-      },
+  /**
+   * Pretty-printing is a local-terminal affordance, so it is gated on `development` specifically —
+   * NOT on "anything that isn't production".
+   *
+   * `pino-pretty` is a devDependency, and every deployed image installs with `npm ci --omit=dev`.
+   * A `!isProd` test therefore boots fine locally and then dies on the first line of logging in any
+   * environment named something other than `production` — staging crashed at
+   * `pino/lib/transport.js:160` with "unable to determine transport target" before it could bind a
+   * port. A deployed box also *wants* JSON: that is what a log aggregator parses.
+   */
+  transport:
+    env.NODE_ENV === 'development'
+      ? {
+          target: 'pino-pretty',
+          options: {
+            colorize: true,
+            translateTime: 'SYS:HH:MM:ss',
+            ignore: 'pid,hostname,service',
+          },
+        }
+      : undefined,
 });
 
 export type Logger = typeof logger;
