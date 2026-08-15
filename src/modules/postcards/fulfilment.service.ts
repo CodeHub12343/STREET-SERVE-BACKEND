@@ -171,7 +171,7 @@ export const postcardFulfilment = {
            * The buyer designs one side; the vendor requires two. The back carries the address
            * block, so it comes from our standard template rather than from them.
            */
-          backUrl: POSTCARD_BACK_TEMPLATE_URL,
+          backUrl: postcardBackTemplateUrl(),
         },
         /** The idempotency key. A repeat is refused by the vendor, never printed twice. */
         orderRef: orderId,
@@ -401,5 +401,28 @@ function buildArtworkUrl(storageKey: string): string {
  * it. A placeholder until the real artwork is produced — and one that is loudly wrong rather than
  * quietly plausible, so it cannot reach a press unnoticed.
  */
-const POSTCARD_BACK_TEMPLATE_URL =
-  process.env.POSTCARD_BACK_TEMPLATE_URL ?? 'https://cdn.streetserve.app/postcards/back-v1.pdf';
+function postcardBackTemplateUrl(): string {
+  const url = process.env.POSTCARD_BACK_TEMPLATE_URL;
+  /**
+   * No fallback.
+   *
+   * This used to default to `https://cdn.streetserve.app/postcards/back-v1.pdf` — a domain that
+   * does not resolve — on the reasoning that a placeholder should be "loudly wrong rather than
+   * quietly plausible". The reasoning was right and the execution was not: the loudness arrived as
+   * an opaque `Print vendor request failed (400)` AFTER the buyer had paid, because the vendor's
+   * actual explanation ("URL provided for the design back was unreachable") was being discarded.
+   * Every postcard order this platform submitted failed here, in staging and in production alike.
+   *
+   * Unset is now a configuration error in our own words, raised before the vendor is called, so
+   * the operator is told what to set rather than left to reverse-engineer a 400.
+   */
+  if (!url) {
+    throw new Error(
+      'POSTCARD_BACK_TEMPLATE_URL is not set. Every mailed postcard needs an address side, and the ' +
+        'print vendor rejects an order whose back artwork it cannot fetch. Set it to a PUBLICLY ' +
+        'reachable file — the vendor fetches it from the internet, so a private or signed URL will ' +
+        'not do.',
+    );
+  }
+  return url;
+}

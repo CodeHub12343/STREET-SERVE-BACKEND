@@ -169,8 +169,22 @@ async function call<T>(opts: CallOptions, parse: (body: unknown) => T): Promise<
       if (res.status === 409 && opts.conflictAs) opts.conflictAs(res.text);
 
       const transient = res.status >= 500 || res.status === 429;
+      /**
+       * The vendor's own explanation goes in the log, not only into the thrown error's `details`.
+       *
+       * A 400 from a print vendor says WHICH field it disliked, and without it the operator sees
+       * "Print vendor request failed (400)" on a paid order with no way to act: the reason existed,
+       * was captured, and was visible nowhere anyone would look. Truncated because a vendor error
+       * body can be a whole HTML page.
+       */
       log.warn(
-        { status: res.status, path: opts.path, attempt, transient },
+        {
+          status: res.status,
+          path: opts.path,
+          attempt,
+          transient,
+          vendorBody: res.text.slice(0, 400),
+        },
         'print vendor returned an error',
       );
       if (transient && attempt < attempts) {
