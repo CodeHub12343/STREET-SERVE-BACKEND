@@ -173,3 +173,25 @@ adminRouter.get(
     ok(res, await communityOpsService.inspectRedemption(id));
   }),
 );
+
+/**
+ * Find a business by name.
+ *
+ * Exists so no admin screen has to ask an operator for a Mongo ObjectId. The client owning this
+ * platform is not a developer, and a control that only accepts a 24-character hex string is not
+ * usable by the person it was built for — worse, it accepts the wrong id just as readily as the
+ * right one.
+ *
+ * Read-only and gated with the other admin overview reads: it exposes business and owner names to
+ * someone who can already see the whole admin console.
+ */
+adminRouter.get(
+  '/businesses/search',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('admin:read_overview'),
+  validate({ query: z.object({ q: z.string().min(1).max(80) }).strict() }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(res, await adminService.searchBusinesses(query<{ q: string }>(req).q));
+  }),
+);

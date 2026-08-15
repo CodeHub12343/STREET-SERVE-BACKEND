@@ -373,6 +373,24 @@ export const rtoService = {
   },
 
   async approveSeller(principal: Principal, sellerId: string, note?: string) {
+    /**
+     * The id must actually be a business.
+     *
+     * This wrote whatever 24-character string it was handed. An operator pasted a USER id into the
+     * "business id" field, the approval was recorded, the screen reported success — and the seller
+     * stayed blocked, with the admin list showing an approval and the vendor's screen showing a
+     * refusal, neither of them wrong and neither explaining the other.
+     *
+     * A permission granted against something that does not exist is worse than a rejected one: it
+     * looks done.
+     */
+    const owner = await vendorsService.getBusinessOwner(sellerId);
+    if (!owner) {
+      throw NotFoundError(
+        'No business with that id. Search for the business by name rather than entering an id — ' +
+          'a user id and a business id look identical and only one of them can be approved.',
+      );
+    }
     await repo.approveSeller(sellerId, principal.userId, note ?? null);
     await writeAudit({
       actorId: principal.userId,
@@ -387,8 +405,29 @@ export const rtoService = {
   /** Admin: who is currently cleared to offer RTO, and revoking that. */
   async listApprovedSellers(limit = 100) {
     const rows = await repo.listApprovedSellers(limit);
+    /**
+     * Resolved to names. The roster listed raw ids, so the only way to check whether the right
+     * business had been approved was to recognise a hex string — which is how a user id sat in this
+     * list looking exactly as legitimate as a business id.
+     *
+     * One query for the batch rather than one per row: this list is read on every visit to the
+     * screen and is allowed to be long.
+     */
+    const { BusinessModel } = await import('../vendors/vendors.model');
+    const businesses = await BusinessModel.find({ _id: { $in: rows.map((r) => r.seller_id) } })
+      .select('name')
+      .lean()
+      .exec();
+    const nameById = new Map(businesses.map((b) => [String(b._id), b.name]));
+
     return rows.map((r) => ({
       sellerId: r.seller_id,
+      /**
+       * Null when the id matches no business — which is exactly the state that prompted this, and
+       * the UI marks it as unknown rather than hiding it. A stale approval must stay visible so it
+       * can be revoked; silently dropping it would leave a permission nobody can see or remove.
+       */
+      businessName: nameById.get(r.seller_id) ?? null,
       approvedBy: r.approved_by,
       note: r.note ?? null,
       approvedAt: r.created_at,

@@ -168,4 +168,46 @@ export const adminService = {
     });
     return { id: targetUserId, status: updated?.status };
   },
+
+  /**
+   * Find a business by name, for the admin screens that have to act on one.
+   *
+   * Every such control — the Rent-to-Own approval roster, the postcard pilot — asked the operator
+   * to paste a 24-character Mongo ObjectId. Nobody outside engineering has one, and pasting the
+   * WRONG one failed silently: an RTO approval recorded against a user id wrote a row, reported
+   * success, and left the seller blocked with nothing on either screen explaining why.
+   *
+   * The owner is returned alongside the name because two businesses can share a name, and an
+   * operator granting a credit-like permission has to be able to tell which one they are granting.
+   */
+  async searchBusinesses(q: string, limit = 10) {
+    const term = q.trim();
+    // Two characters minimum: a single letter matches most of the table and helps nobody choose.
+    if (term.length < 2) return [];
+    // Escaped — an operator typing "(" in a shop name must not produce an invalid-regex 500.
+    const safe = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rows = await BusinessModel.find({ name: { $regex: safe, $options: 'i' } })
+      .select('name owner_user_id status is_hub')
+      .limit(Math.min(limit, 25))
+      .lean()
+      .exec();
+
+    const owners = await UserModel.find({ _id: { $in: rows.map((r) => r.owner_user_id) } })
+      .select('display_name email')
+      .lean()
+      .exec();
+    const ownerById = new Map(owners.map((o) => [String(o._id), o]));
+
+    return rows.map((r) => {
+      const owner = ownerById.get(String(r.owner_user_id));
+      return {
+        id: String(r._id),
+        name: r.name,
+        status: r.status,
+        isHub: Boolean(r.is_hub),
+        ownerName: owner?.display_name ?? null,
+        ownerEmail: owner?.email ?? null,
+      };
+    });
+  },
 };
