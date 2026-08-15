@@ -11,6 +11,7 @@ import { pingService } from '../modules/growth/ping.service';
 import { adsService } from '../modules/ads/ads.service';
 import { payforwardService } from '../modules/payforward/payforward.service';
 import { postcardsService } from '../modules/postcards/postcards.service';
+import { subscriptionsService } from '../modules/subscriptions/subscriptions.service';
 import { boostService } from '../modules/boost/boost.service';
 import { ERROR_CODES } from '../shared/errors/codes';
 import { ForbiddenError, ValidationError } from '../shared/errors/AppError';
@@ -104,6 +105,30 @@ stripeWebhookRouter.post(
           String(obj.payment_intent ?? ''),
           String(obj.status ?? 'lost'),
         );
+        break;
+      }
+      /**
+       * The whole recurring half of a subscription's life.
+       *
+       * `subscribe` records a status once and `confirm` settles it after the first payment — and
+       * before these cases existed, nothing ever touched the record again. Entitlement reads
+       * `status` alone, so a card that failed next month left Pro, Featured, Verified, the AI
+       * assistant, Seller Plus and the Stock Protection waiver running indefinitely, unpaid.
+       *
+       * `updated` carries every transition that matters (`active → past_due`, recovery back to
+       * `active`, a scheduled cancel) and `deleted` is the final stop, so the two together are
+       * sufficient. `invoice.payment_failed` is deliberately NOT handled: Stripe follows it with a
+       * subscription.updated carrying the new status, and acting on both would mean two sources of
+       * truth for one fact.
+       */
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted': {
+        await subscriptionsService.applyStripeState(String(obj.id), {
+          status: String(obj.status ?? 'canceled'),
+          currentPeriodEnd:
+            typeof obj.current_period_end === 'number' ? obj.current_period_end : null,
+          cancelAtPeriodEnd: Boolean(obj.cancel_at_period_end),
+        });
         break;
       }
       case 'account.updated': {

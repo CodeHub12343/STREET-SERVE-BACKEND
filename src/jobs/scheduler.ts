@@ -159,6 +159,19 @@ export async function registerScheduledJobs(connection: Redis): Promise<void> {
     { repeat: { every: 86_400_000 }, jobId: 'boost-rollover', removeOnComplete: true },
   );
   await sweeps.add(
+    'subscription-reconcile',
+    {},
+    /**
+     * Six-hourly. The webhook already carries these transitions within seconds, so this exists only
+     * for the deliveries that never arrive — a deploy mid-event, a timeout, an instance asleep.
+     * Stripe gives up retrying long before anyone would notice, and the failure mode is a cancelled
+     * plan that keeps its entitlement, so the gap must be bounded by something other than luck.
+     * Six hours costs one Stripe read per entitled subscription and bounds the exposure to a day at
+     * the very worst.
+     */
+    { repeat: { every: 21_600_000 }, jobId: 'subscription-reconcile', removeOnComplete: true },
+  );
+  await sweeps.add(
     'payforward-expiry',
     {},
     // Daily. Expiry is a 12-month horizon, so a tighter cadence would only add load to discover the

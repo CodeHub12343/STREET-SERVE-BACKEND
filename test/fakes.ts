@@ -198,6 +198,21 @@ export class FakeStripeGateway implements StripeGateway {
   /** Every subscribe call as the service made it — lets tests assert the gateway got what it needs. */
   subscriptionInputs: { plan: string; planName?: string; priceCents: number }[] = [];
 
+  /**
+   * Move a subscription to a status Stripe would report on its own — a failed renewal becoming
+   * `past_due`, dunning ending in `canceled`. Nothing in the app can produce those transitions, so
+   * without this a test cannot reach the states the reconcile sweep exists to catch.
+   */
+  setSubscriptionStatus(subscriptionId: string, status: string): void {
+    const sub = this.subscriptions.find((s) => s.subscriptionId === subscriptionId);
+    if (sub) sub.status = status;
+  }
+
+  /** The id Stripe assigned to the Nth subscription created — webhooks arrive keyed on it. */
+  lastSubscriptionId(): string | undefined {
+    return this.subscriptions[this.subscriptions.length - 1]?.subscriptionId;
+  }
+
   createSubscription(input: {
     plan: string;
     planName?: string;

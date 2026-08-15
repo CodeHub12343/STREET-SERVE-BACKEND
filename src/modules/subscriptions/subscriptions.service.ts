@@ -5,7 +5,9 @@ import {
   SUBSCRIPTION_PLANS,
   type SubscriptionPlan,
 } from '../../config/constants';
+import { logger } from '../../config/logger';
 import { stripe } from '../../integrations/stripe';
+import { notificationsService } from '../notifications/notifications.service';
 import { writeAudit } from '../../shared/audit';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import { BusinessRuleError, ForbiddenError, NotFoundError } from '../../shared/errors/AppError';
@@ -111,7 +113,17 @@ export const subscriptionsService = {
   async cancel(principal: Principal, plan: SubscriptionPlan, businessId: string | undefined) {
     const { subscriberId } = await resolveSubscriber(principal, plan, businessId);
     const record = await repo.find(subscriberId, plan);
-    if (!record || record.status !== 'active') throw NotFoundError('No active subscription');
+    /**
+     * Entitled, not literally `active`. A `trialing` subscription grants every entitlement
+     * (`ENTITLED_STATUSES`) and will start charging, yet an exact `active` check refused to cancel
+     * it — the one subscriber most likely to want out was told they had nothing to cancel.
+     */
+    if (
+      !record ||
+      !ENTITLED_STATUSES.includes(record.status as (typeof ENTITLED_STATUSES)[number])
+    ) {
+      throw NotFoundError('No active subscription');
+    }
     if (record.stripe_subscription_id) {
       await stripe().cancelSubscription({ subscriptionId: record.stripe_subscription_id, atPeriodEnd: false });
     }
@@ -123,6 +135,111 @@ export const subscriptionsService = {
       entityId: `${subscriberId}:${plan}`,
     });
     return this.view(updated!);
+  },
+
+  /**
+   * Apply Stripe's view of a subscription to our record.
+   *
+   * Entitlement is read from `status` alone (`repo.isActive`), and until this existed nothing could
+   * ever change that status after the first payment. A card that expired next month left the record
+   * saying `active` forever: Pro, Featured, Verified, the AI assistant, Seller Plus and the Stock
+   * Protection waiver all continued, unpaid, with no way for the platform to notice.
+   *
+   * Deliberately dumb — it stores what Stripe reports and derives nothing. Stripe is the authority
+   * on whether a subscription is paid; any local opinion here would eventually contradict it.
+   *
+   * `unknown subscription` is logged, not thrown: Stripe delivers events for objects we may never
+   * have recorded (a subscription created directly in their dashboard), and a webhook that throws is
+   * retried forever for something that will never resolve.
+   */
+  async applyStripeState(
+    stripeSubscriptionId: string,
+    state: { status: string; currentPeriodEnd: number | null; cancelAtPeriodEnd: boolean },
+  ): Promise<boolean> {
+    const before = await repo.findByStripeId(stripeSubscriptionId);
+    if (!before) {
+      logger.warn({ stripeSubscriptionId }, 'stripe subscription event for an unknown subscription');
+      return false;
+    }
+    if (
+      before.status === state.status &&
+      before.cancel_at_period_end === state.cancelAtPeriodEnd
+    ) {
+      return false;
+    }
+
+    await repo.applyStripeState(stripeSubscriptionId, state);
+
+    const wasEntitled = ENTITLED_STATUSES.includes(
+      before.status as (typeof ENTITLED_STATUSES)[number],
+    );
+    const nowEntitled = ENTITLED_STATUSES.includes(
+      state.status as (typeof ENTITLED_STATUSES)[number],
+    );
+
+    /**
+     * Audited as a lapse only when an entitlement was actually lost. `active → past_due` is the one
+     * that costs someone something, and it must be distinguishable in the audit log from an ordinary
+     * status change — it is the moment a paying vendor stopped being one.
+     */
+    await writeAudit({
+      actorId: 'system',
+      action:
+        wasEntitled && !nowEntitled ? 'subscription.lapsed' : 'subscription.status_changed',
+      entityType: 'subscription',
+      entityId: `${before.subscriber_id}:${before.plan}`,
+      metadata: { from: before.status, to: state.status, plan: before.plan },
+    });
+
+    if (wasEntitled && !nowEntitled) {
+      /**
+       * Told, not silently downgraded. The vendor's plan stopping is something they can fix — a
+       * card usually — and the first they would otherwise know is a feature quietly disappearing.
+       *
+       * A business-scoped plan notifies the OWNER: the inbox is addressed to a user, and a business
+       * is not somebody who can be told anything.
+       */
+      const userId =
+        before.subscriber_type === 'user'
+          ? before.subscriber_id
+          : await vendorsService.getBusinessOwner(before.subscriber_id);
+      if (userId) {
+        notificationsService.notify(userId, {
+          category: 'billing',
+          title: `${SUBSCRIPTION_PLAN_DEFS[before.plan as SubscriptionPlan].name} has stopped`,
+          body: 'We could not take the latest payment, so the plan is paused. Update your card to turn it back on.',
+          data: { plan: before.plan, status: state.status },
+        });
+      }
+    }
+    return true;
+  },
+
+  /**
+   * Re-read every entitled subscription from Stripe and apply what it says.
+   *
+   * The webhook is the fast path; this is the safety net. A single missed delivery — a deploy, a
+   * timeout, the API asleep on a free instance — would otherwise leave a cancelled plan entitled
+   * indefinitely, because nothing else ever revisits the record. Stripe stops retrying long before
+   * a person would notice.
+   */
+  async reconcile(): Promise<{ checked: number; changed: number }> {
+    const rows = await repo.listEntitled();
+    let changed = 0;
+    for (const row of rows) {
+      try {
+        const state = await stripe().getSubscription(row.stripe_subscription_id!);
+        if (await this.applyStripeState(row.stripe_subscription_id!, state)) changed += 1;
+      } catch (err) {
+        // One unreadable subscription must not stop the sweep reaching the rest.
+        logger.error(
+          { err, stripeSubscriptionId: row.stripe_subscription_id },
+          'subscription reconcile failed for one row',
+        );
+      }
+    }
+    if (changed > 0) logger.info({ checked: rows.length, changed }, 'subscription reconcile');
+    return { checked: rows.length, changed };
   },
 
   hasActive(subscriberId: string, plan: SubscriptionPlan): Promise<boolean> {

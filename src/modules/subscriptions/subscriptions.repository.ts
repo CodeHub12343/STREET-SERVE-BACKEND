@@ -81,4 +81,52 @@ export const subscriptionsRepository = {
       { new: true },
     ).exec();
   },
+
+  /**
+   * Look a subscription up by Stripe's id.
+   *
+   * A webhook knows only what Stripe knows — the subscription id — and never our subscriber/plan
+   * pair, so every inbound lifecycle event has to arrive through this.
+   */
+  findByStripeId(stripeSubscriptionId: string) {
+    return SubscriptionModel.findOne({ stripe_subscription_id: stripeSubscriptionId })
+      .lean()
+      .exec();
+  },
+
+  /**
+   * Every subscription currently granting an entitlement.
+   *
+   * The reconcile sweep reads this rather than the whole collection: a `canceled` row already
+   * grants nothing, so re-checking it with Stripe spends a request to learn nothing. The rows that
+   * matter are the ones where being wrong means giving a paid plan away.
+   */
+  listEntitled() {
+    return SubscriptionModel.find({
+      status: { $in: ENTITLED_STATUSES },
+      stripe_subscription_id: { $nin: [null, ''] },
+    })
+      .lean()
+      .exec();
+  },
+
+  /** Full state sync from Stripe — status, period end and the pending-cancel flag together. */
+  applyStripeState(
+    stripeSubscriptionId: string,
+    state: { status: string; currentPeriodEnd: number | null; cancelAtPeriodEnd: boolean },
+  ) {
+    return SubscriptionModel.findOneAndUpdate(
+      { stripe_subscription_id: stripeSubscriptionId },
+      {
+        $set: {
+          status: state.status,
+          cancel_at_period_end: state.cancelAtPeriodEnd,
+          ...(state.currentPeriodEnd
+            ? { current_period_end: new Date(state.currentPeriodEnd * 1000) }
+            : {}),
+        },
+      },
+      { new: true },
+    ).exec();
+  },
 };
