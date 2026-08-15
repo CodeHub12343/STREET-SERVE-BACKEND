@@ -8,6 +8,8 @@ import {
   RTO_REMINDER_LEAD_DAYS,
   type RtoReminderStage,
 } from '../../config/constants';
+import { env, isProd } from '../../config/env';
+import { logger } from '../../config/logger';
 import { publish } from '../../events/bus';
 import { writeAudit } from '../../shared/audit';
 import { formatCents } from '../../shared/money';
@@ -299,12 +301,33 @@ async function assertCityEnabled(citySlug: string | null | undefined): Promise<v
  * without the thing it guards actually being fixed.
  */
 function assertAgreementReviewed(type: 'rto' | 'consignment_rto'): void {
-  if (!isAgreementReviewed(type)) {
-    throw BusinessRuleError(
-      ERROR_CODES.BUSINESS_RULE,
-      'Rent-to-Own is not open yet — the agreement is still in legal review.',
+  if (isAgreementReviewed(type)) return;
+
+  /**
+   * The one way past this, and it cannot reach a real customer.
+   *
+   * The lifecycle has to be walkable end to end before launch — approval, offer, acceptance,
+   * instalments, payoff — and every step after acceptance was untestable while this refused. The
+   * escape is therefore scoped to where the harm cannot occur rather than removed: `isProd` is
+   * checked HERE, so setting the flag in production changes nothing at all. A real customer still
+   * cannot clickwrap placeholder terms, which is the whole thing this gate protects.
+   *
+   * Logged at warn on every use, because "we tested with the bypass on" is a fact someone will need
+   * when the real text lands and the early acceptances are audited.
+   */
+  if (!isProd && env.RTO_ALLOW_UNREVIEWED_AGREEMENT) {
+    logger.warn(
+      { type },
+      'RTO_ALLOW_UNREVIEWED_AGREEMENT is on — accepting a PLACEHOLDER agreement. ' +
+        'These acceptance records are not enforceable and must be re-collected once the reviewed text lands.',
     );
+    return;
   }
+
+  throw BusinessRuleError(
+    ERROR_CODES.BUSINESS_RULE,
+    'Rent-to-Own is not open yet — the agreement is still in legal review.',
+  );
 }
 
 export const rtoService = {

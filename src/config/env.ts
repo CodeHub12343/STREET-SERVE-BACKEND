@@ -74,6 +74,23 @@ const EnvSchema = z.object({
     .enum(['true', 'false'])
     .default('false')
     .transform((v) => v === 'true'),
+  /**
+   * Dev/staging only: let a customer accept a rent-to-own agreement whose text is still the
+   * placeholder pending attorney review.
+   *
+   * The gate it relaxes exists so real customers cannot clickwrap unenforceable terms and build up
+   * acceptance records that would all have to be re-collected. That reasoning does not apply to a
+   * staging box with test accounts, where the alternative is that the whole RTO lifecycle cannot be
+   * walked end to end before launch.
+   *
+   * Never honored in production — enforced in `assertAgreementReviewed`, not merely documented, and
+   * the same convention as KYC_DEV_AUTO_APPROVE. Turning it on is therefore incapable of letting a
+   * real customer accept placeholder terms, which is the property the original gate was protecting.
+   */
+  RTO_ALLOW_UNREVIEWED_AGREEMENT: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((v) => v === 'true'),
   KYC_RETURN_URL: z.string().url().default('http://localhost:3000/verify/complete'),
   CONNECT_RETURN_URL: z.string().url().default('http://localhost:3000/payouts/complete'),
   /** Public app origin — used to build the customer-facing payment link a seller shows as a QR. */
