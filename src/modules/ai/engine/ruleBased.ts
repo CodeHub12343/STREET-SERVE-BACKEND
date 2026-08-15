@@ -7,6 +7,7 @@ import {
   AI_RECENT_WINDOW_DAYS,
   AI_TIME_BANDS,
   AI_WEIGHTS,
+  FEATURED_LABEL,
 } from '../../../config/constants';
 import { distanceMeters } from '../../../shared/geo';
 import { NotFoundError } from '../../../shared/errors/AppError';
@@ -51,6 +52,20 @@ function inTimeBand(tab: string | null, hourUtc: number): boolean {
  * explainable reason. Uses real first-party signals (inventory_sales, checkouts, ai_recommendations).
  * No ML — this is deterministic ranking, and the reason line is always the true decomposition.
  */
+/**
+ * Paid boosts, loaded lazily.
+ *
+ * A top-level  here pulls the ads module — and with it Stripe, the event bus
+ * and vendors — into the AI engine's module graph at init. That is why every other cross-module
+ * call in this codebase is a dynamic import (see rto.service -> platform.service, ai.routes ->
+ * consignment.service): the eager version made the Phase 6 recommendation test go from 6s to a 30s
+ * timeout.
+ */
+async function featuredProductBoosts(): Promise<Map<string, number>> {
+  const { adsService } = await import('../../ads/ads.service');
+  return adsService.featuredBoosts('featured_product');
+}
+
 export class RuleBasedEngine implements RecommendationEngine {
   readonly version = AI_ENGINE_VERSION;
 
@@ -61,7 +76,7 @@ export class RuleBasedEngine implements RecommendationEngine {
     // A-4: acceptance uses a wider window than sell-through — accepts are far rarer events than
     // sales, so a 7-day window would leave almost every product below the minimum sample.
     const acceptanceSince = new Date(Date.now() - ACCEPTANCE_WINDOW_MS);
-    const [products, sales, sellerProductIds, acceptanceStats, personallyAccepted, profile] =
+    const [products, sales, sellerProductIds, acceptanceStats, personallyAccepted, profile, featured] =
       await Promise.all([
         consignmentRepository.availableProducts(200),
         consignmentRepository.recentProductSales(since),
@@ -71,6 +86,14 @@ export class RuleBasedEngine implements RecommendationEngine {
         // D-2: what this seller says they're good at and where they sell. Null when they've told us
         // nothing AND done nothing — the engine then behaves exactly as it did before Phase D.
         sellersService.matchingContext(ctx.sellerId),
+        /**
+         * F-1 paid boosts. Fetched HERE and not only in the forecaster: the forecast engine was the
+         * single consumer of featuredBoosts, and it only runs under AI_PROVIDER=forecast — so under
+         * the default provider a vendor could buy a featured product, be charged, have the placement
+         * go active, and have it change nothing at all. A product sold whose only consumer is not
+         * running is not a product.
+         */
+        featuredProductBoosts(),
       ]);
     if (products.length === 0) return [];
 
@@ -160,7 +183,14 @@ export class RuleBasedEngine implements RecommendationEngine {
         personallyAccepted.has(pid) ? AI_ACCEPTANCE_PERSONAL_BOOST : 0,
       );
 
+      /**
+       * Additive and bounded, matching the forecaster: it lifts a product within results it already
+       * qualifies for and can never remove or bury an organic one.
+       */
+      const featuredBoost = featured.get(pid) ?? 0;
+
       const score =
+        featuredBoost +
         AI_WEIGHTS.sellThrough * sellThrough +
         AI_WEIGHTS.affinity * affinity +
         AI_WEIGHTS.timeOfDay * timeOfDay +
@@ -177,6 +207,8 @@ export class RuleBasedEngine implements RecommendationEngine {
       // be able to say so, or the reason line quietly becomes a lie.
       if (personallyAccepted.has(pid)) factors.push('you picked this up before');
       else if (acceptance > 0) factors.push('other sellers near you took this on');
+      // Disclosure is not optional: a paid lift the seller cannot see is a ranking they cannot trust.
+      if (featuredBoost > 0) factors.push(FEATURED_LABEL.toLowerCase());
       const reasonSummary =
         factors.length > 0
           ? `Recommended because: ${factors.join('; ')}.`
