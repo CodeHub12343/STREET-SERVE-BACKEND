@@ -507,10 +507,42 @@ export const adsService = {
   },
 
   /** The advertiser's own campaigns, with real delivery numbers — replaces manual reporting. */
+  /**
+   * Everything this caller has bought — personally AND for the business they are acting as.
+   *
+   * This read was `owner_id: businessId ?? principal.userId`: either/or, never both. But
+   * `createFeatured` deliberately keys every featured placement to the BUYER (`owner_type: 'user'`)
+   * so a hub owner's featured hub appears on their own dashboard. The two rules contradicted each
+   * other: a featured product bought while a business was active got stored against the user and
+   * looked up against the business, so it could not appear at all.
+   *
+   * The buyer had paid, the placement was live and serving, and the screen that exists to show it
+   * returned nothing — which reads as the payment having vanished.
+   *
+   * A union rather than a switch, because "my placements" means exactly that: the ad I bought for
+   * my business and the product I featured are both mine, and no screen should make me guess which
+   * identity I was wearing when I paid.
+   */
   async mine(principal: Principal, businessId?: string) {
-    const rows = await PlacementModel.find({
-      owner_id: businessId ?? principal.userId,
-    })
+    const owners: string[] = [principal.userId];
+
+    if (businessId) {
+      /**
+       * The ownership check this never had.
+       *
+       * `businessId` came straight off the query string into the filter, so any authenticated user
+       * could read any business's placements — their live campaigns, budgets and spend — by putting
+       * someone else's id in the URL. Nothing else in the request had to be forged.
+       */
+      const owner = await vendorsService.getBusinessOwner(businessId);
+      if (!owner) throw NotFoundError('Business not found');
+      if (owner !== principal.userId) {
+        throw ForbiddenError('You do not own this business', ERROR_CODES.NOT_OWNER);
+      }
+      owners.push(businessId);
+    }
+
+    const rows = await PlacementModel.find({ owner_id: { $in: owners } })
       .sort({ created_at: -1 })
       .limit(100)
       .lean()
