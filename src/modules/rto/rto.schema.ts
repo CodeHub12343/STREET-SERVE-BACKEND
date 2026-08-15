@@ -110,6 +110,8 @@ export const BrowseListingsQuery = z
   .object({
     citySlug: z.string().min(1).max(64).optional(),
     categoryId: objectId.optional(),
+    /** One seller's active offers — what the business profile asks for. */
+    sellerId: objectId.optional(),
     limit: z.coerce.number().int().min(1).max(50).optional(),
   })
   .strict();

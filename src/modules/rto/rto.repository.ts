@@ -45,12 +45,21 @@ export const rtoRepository = {
       .exec();
   },
   /** Public browse. Only live, in-stock offers in a market the platform has opened. */
-  browseListings(filter: { citySlug?: string; categoryId?: string }, limit: number) {
+  browseListings(
+    filter: { citySlug?: string; categoryId?: string; sellerId?: string },
+    limit: number,
+  ) {
     return RtoListingModel.find({
       status: 'active',
       quantity_available: { $gt: 0 },
       ...(filter.citySlug ? { city_slug: filter.citySlug } : {}),
       ...(filter.categoryId ? { category_id: filter.categoryId } : {}),
+      /**
+       * One seller's offers, for their business profile. You rent to own FROM someone, so the offer
+       * belongs where the customer is already deciding about that seller — not only in a separate
+       * marketplace they have to think to visit.
+       */
+      ...(filter.sellerId ? { seller_id: filter.sellerId } : {}),
     })
       .sort({ created_at: -1 })
       .limit(limit)

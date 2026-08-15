@@ -635,7 +635,10 @@ export const rtoService = {
   },
 
   /** Public browse — live, in-stock offers only. */
-  async browseListings(filter: { citySlug?: string; categoryId?: string }, limit = 50) {
+  async browseListings(
+    filter: { citySlug?: string; categoryId?: string; sellerId?: string },
+    limit = 50,
+  ) {
     const rows = await repo.browseListings(filter, limit);
     return rows.map((r) => this.listingView(r));
   },
