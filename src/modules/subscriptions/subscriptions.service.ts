@@ -16,6 +16,27 @@ import { vendorsService } from '../vendors/vendors.service';
 import { ENTITLED_STATUSES, subscriptionsRepository as repo } from './subscriptions.repository';
 
 /**
+ * Every subscription status this platform stores, matching `Subscription.status` in the model and
+ * Stripe's own vocabulary.
+ *
+ * Written out as literals on purpose. `applyStripeState` stores whatever Stripe reports, so the
+ * only place `unpaid` or `incomplete_expired` ever appear in our code is here — and a value no
+ * source file mentions is indistinguishable from a dead enum entry, both to the A-2 reachability
+ * gate and to the next person reading the schema.
+ */
+export const STRIPE_SUBSCRIPTION_STATUSES = [
+  'incomplete',
+  'incomplete_expired',
+  'trialing',
+  'active',
+  'past_due',
+  'canceled',
+  'unpaid',
+] as const;
+
+export type StripeSubscriptionStatus = (typeof STRIPE_SUBSCRIPTION_STATUSES)[number];
+
+/**
  * Monetization subscriptions (R29/R30): purchase/cancel a plan and read entitlements. Four plans over
  * existing hooks — Pro (lower marketplace fee), Featured (Trending boost), Verified badge, AI assistant.
  * Business plans require the caller to own the business; the user plan is self-scoped.
@@ -159,6 +180,23 @@ export const subscriptionsService = {
     const before = await repo.findByStripeId(stripeSubscriptionId);
     if (!before) {
       logger.warn({ stripeSubscriptionId }, 'stripe subscription event for an unknown subscription');
+      return false;
+    }
+    /**
+     * Stripe's status, checked against the ones we model, before it reaches the document.
+     *
+     * The status is written straight through from an external system, so an unrecognised value —
+     * a status Stripe adds later — would fail Mongoose's enum validation INSIDE the webhook
+     * handler. That throws a 500 back at Stripe, which then retries the same unrecognised value
+     * on a backoff until it gives up. Refusing it here instead leaves the subscription on its last
+     * known good status, which is the safe direction: an unknown status must not silently revoke a
+     * plan somebody is paying for.
+     */
+    if (!STRIPE_SUBSCRIPTION_STATUSES.includes(state.status as StripeSubscriptionStatus)) {
+      logger.error(
+        { stripeSubscriptionId, status: state.status },
+        'unrecognised stripe subscription status — leaving the record unchanged',
+      );
       return false;
     }
     if (

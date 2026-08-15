@@ -76,8 +76,6 @@ const KNOWN_UNWRITTEN: Record<string, string> = {
     'A failed Stripe refund leaves the row pending, so the customer appears refunded when they are not. The highest-value entry on this list.',
   'ShelterPartner.status.suspended': 'No partner suspension action.',
   'ShelterEnrollment.status.revoked': 'No enrollment revocation action.',
-  'Subscription.status.past_due':
-    'No dunning: a failed subscription renewal does not mark the subscription past due.',
   'Business.status.suspended': 'No vendor suspension action.',
 
   // Found by widening the scan beyond `*.model.ts` (Phase 7). Both are worse than they look: the
