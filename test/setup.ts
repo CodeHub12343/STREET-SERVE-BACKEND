@@ -22,6 +22,13 @@ process.env.AUTH_AUDIENCE = AUDIENCE;
 process.env.AUTH_WEBHOOK_SECRET = 'test-webhook-secret';
 process.env.STRIPE_WEBHOOK_SECRET = 'whsec_test';
 process.env.KYC_WEBHOOK_SECRET = 'kyc-test-secret';
+/**
+ * Required config, not decoration: postcard submission refuses to call the print vendor without an
+ * address-side template, because the vendor rejects an order whose back artwork it cannot fetch.
+ * Leaving it unset made every fulfilment test fail at `advance(null)` — the order had never been
+ * submitted, so it had no vendor id. The fake vendor never fetches this, so any URL will do.
+ */
+process.env.POSTCARD_BACK_TEMPLATE_URL = 'https://example.test/postcards/back-v1.pdf';
 process.env.METRICS_ENABLED = 'true';
 process.env.OPENAPI_ENABLED = 'true';
 // Off in tests: no test asserts throttling, and with it on the money limiter (keyed by IP because
