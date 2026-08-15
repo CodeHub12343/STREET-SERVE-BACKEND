@@ -84,6 +84,14 @@ export const ERROR_CODES = {
   PAY_FORWARD_DAILY_LIMIT: 'PAY_FORWARD_DAILY_LIMIT',
   /** Nothing left in the pool, or nothing left within the vendor's caps. */
   PAY_FORWARD_UNAVAILABLE: 'PAY_FORWARD_UNAVAILABLE',
+
+  /**
+   * This month's free AI advice is used up and the caller has no AI Marketing Assistant plan.
+   *
+   * Its own code rather than FEATURE_DISABLED: the client has to tell "you cannot have this" apart
+   * from "you have had your free ones", because only the second has an upgrade CTA attached.
+   */
+  AI_QUOTA_EXCEEDED: 'AI_QUOTA_EXCEEDED',
   /** The business has switched off new contributions. */
   PAY_FORWARD_NOT_ACCEPTING: 'PAY_FORWARD_NOT_ACCEPTING',
 

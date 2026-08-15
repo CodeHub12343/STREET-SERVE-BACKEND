@@ -1737,3 +1737,22 @@ export const TRAINING_PASS_PERCENT = 70;
  */
 export const RESIDENT_STARTER_GRANT_MAX_CENTS = 5_000; // $50 of stock
 export const RESIDENT_STARTER_GRANT_LIMIT = 1; // one per resident, per shelter
+
+/**
+ * Free AI advice per user per calendar month, before the AI Marketing Assistant plan is required.
+ *
+ * The plan sold "unlimited AI coaching, pricing and marketing copy" for $19.99/month while nothing
+ * read the entitlement — every AI route was open to everyone, so a subscriber paid for exactly what
+ * a non-subscriber already had. This is the number that makes the plan mean something.
+ *
+ * Five, not one and not thirty. One answer is not enough to judge whether the advice is any good,
+ * so a single free call sells nothing. Thirty (one a day) covers ordinary use and no one ever
+ * reaches a decision. Five lets a seller run the Income Coach, price something and pull
+ * recommendations — a real taste — while anyone using it seriously runs out within the month.
+ *
+ * Per CALENDAR month rather than a rolling window: it resets on the same cadence the subscription
+ * bills on, so "you have used your 5 free this month" and "the plan is unlimited" describe the same
+ * period. A rolling 30-day window would drip allowances back one at a time and never produce that
+ * moment.
+ */
+export const AI_FREE_REQUESTS_PER_MONTH = 5;

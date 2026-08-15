@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import type { z } from 'zod';
 
 import { authenticate } from '../../middleware/auth';
+import { requireAiQuota } from '../../middleware/aiQuota';
 import { asyncHandler } from '../../middleware/asyncHandler';
 import { rateLimit } from '../../middleware/rateLimit';
 import { requirePermission } from '../../middleware/rbac';
@@ -9,6 +10,7 @@ import { body, params, query, validate } from '../../middleware/validate';
 import { ok } from '../../shared/respond';
 import { UnauthenticatedError } from '../../shared/errors/AppError';
 import { aiService } from './ai.service';
+import { aiQuotaService } from './aiQuota.service';
 import {
   CoachPlanBody,
   CoachingBody,
@@ -38,6 +40,7 @@ aiRouter.post(
   rateLimit('ai'),
   authenticate,
   requirePermission('ai:recommend'),
+  requireAiQuota,
   validate({ body: CoachPlanBody }),
   asyncHandler(async (req: Request, res: Response) => {
     const input = body<z.infer<typeof CoachPlanBody>>(req);
@@ -80,6 +83,7 @@ aiRouter.get(
   rateLimit('ai'),
   authenticate,
   requirePermission('ai:recommend'),
+  requireAiQuota,
   validate({ query: RecommendQuery }),
   asyncHandler(async (req: Request, res: Response) => {
     const q = query<z.infer<typeof RecommendQuery>>(req);
@@ -99,6 +103,7 @@ aiRouter.get(
   rateLimit('ai'),
   authenticate,
   requirePermission('ai:recommend'),
+  requireAiQuota,
   validate({ query: RecommendQuery }),
   asyncHandler(async (req: Request, res: Response) => {
     const q = query<z.infer<typeof RecommendQuery>>(req);
@@ -129,6 +134,7 @@ aiRouter.get(
   rateLimit('ai'),
   authenticate,
   requirePermission('ai:pricing'),
+  requireAiQuota,
   validate({ query: PricingQuery }),
   asyncHandler(async (req: Request, res: Response) => {
     const q = query<z.infer<typeof PricingQuery>>(req);
@@ -141,6 +147,7 @@ aiRouter.post(
   rateLimit('ai'),
   authenticate,
   requirePermission('ai:coaching'),
+  requireAiQuota,
   validate({ body: CoachingBody }),
   asyncHandler(async (req: Request, res: Response) => {
     const b = body<z.infer<typeof CoachingBody>>(req);
@@ -159,5 +166,24 @@ aiRouter.get(
       res,
       await aiService.hubDashboard(principal(req), params<z.infer<typeof HubIdParam>>(req).id),
     );
+  }),
+);
+
+/**
+ * What is left of this month's free AI advice.
+ *
+ * Deliberately not metered — asking how many free calls remain must not spend one, and a seller who
+ * has run out still needs to be able to see that they have run out.
+ *
+ * Exists so the dashboard can show the allowance running down while it is being used. A limit that
+ * only announces itself at the moment of refusal reads as the product breaking rather than as
+ * something the seller was told about and can act on.
+ */
+aiRouter.get(
+  '/quota',
+  rateLimit('read'),
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(res, await aiQuotaService.status(principal(req).userId));
   }),
 );
