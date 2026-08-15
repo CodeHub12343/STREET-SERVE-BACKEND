@@ -29,6 +29,7 @@ import { notificationsService } from '../notifications/notifications.service';
 import { corridorsService } from './corridors.service';
 import { queueService } from '../queue/queue.service';
 import { resolveModulesFrom } from '../vendors/modules.service';
+import { promotionsService } from '../promotions/promotions.service';
 import { BusinessModel } from '../vendors/vendors.model';
 import { vendorsService } from '../vendors/vendors.service';
 import { liveStore } from './liveStore';
@@ -393,6 +394,20 @@ export const livemapService = {
       businesses.map((b) => String(b._id)),
     );
 
+    /**
+     * 7.6 — a live flash sale, on the pin.
+     *
+     * The discount already reached the price at checkout, but nothing on any customer surface said
+     * a sale was running: the buyer found out by noticing the total was lower than expected. That
+     * is the wrong half of a marketing instrument to ship — a discount nobody can see attracts
+     * nobody and simply reduces what the customers you already had are charged.
+     *
+     * One query for the whole viewport, not one per pin.
+     */
+    const discountByBusiness = await promotionsService.liveDiscountByBusiness(
+      businesses.map((b) => String(b._id)),
+    );
+
     const pins = [];
     for (const s of sessions) {
       let name: string | null = null;
@@ -436,6 +451,12 @@ export const livemapService = {
          * wave-down had been accepted, which is exactly the decision they had not made yet.
          */
         etaMinutes: etaMinutesFor(s.status, coords as [number, number], input.lng, input.lat),
+        /**
+         * Business-wide flash sale percent, or 0. Sellers have no menu and therefore no sale.
+         * Item-scoped sales are deliberately excluded upstream — see liveDiscountByBusiness.
+         */
+        discountPercent:
+          s.actor_type === 'business' ? (discountByBusiness.get(s.actor_id) ?? 0) : 0,
         location: { type: 'Point', coordinates: coords },
       });
     }

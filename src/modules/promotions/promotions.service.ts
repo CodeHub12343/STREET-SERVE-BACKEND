@@ -198,6 +198,41 @@ export const promotionsService = {
   },
 
   /**
+   * The best live discount for each of many businesses, in one query.
+   *
+   * The map and the nearby list show dozens of businesses at once, so asking per business would be
+   * a request per pin. Only BUSINESS-WIDE sales count here: an item-scoped sale cannot honestly be
+   * advertised as "20% off" on a pin, because it is 20% off one drink and nothing else — a customer
+   * who travels for that and finds it does not apply to their order has been misled by us.
+   *
+   * Returns the highest percent per business; discounts never stack (A-7), so the best one is the
+   * only one worth showing.
+   */
+  async liveDiscountByBusiness(
+    businessIds: string[],
+    now: Date = new Date(),
+  ): Promise<Map<string, number>> {
+    const best = new Map<string, number>();
+    if (businessIds.length === 0) return best;
+
+    const sales = await FlashSaleModel.find({
+      business_id: { $in: businessIds },
+      menu_item_id: null,
+      cancelled_at: null,
+      starts_at: { $lte: now },
+      ends_at: { $gt: now },
+    })
+      .select({ business_id: 1, percent: 1 })
+      .lean();
+
+    for (const s of sales) {
+      const current = best.get(s.business_id) ?? 0;
+      if (s.percent > current) best.set(s.business_id, s.percent);
+    }
+    return best;
+  },
+
+  /**
    * The contest candidates for one order.
    *
    * Item-scoped sales are returned only for items actually in the cart — a 50%-off sale on a drink
