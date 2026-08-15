@@ -4,7 +4,7 @@ import { decodeCursor, encodeCursor, type Page } from '../../shared/pagination';
 import { NotFoundError } from '../../shared/errors/AppError';
 import { identityRepository } from '../identity/identity.repository';
 import type { Principal } from '../../shared/types/principal';
-import { UserModel } from '../identity/identity.model';
+import { UserModel, VerificationRecordModel } from '../identity/identity.model';
 import { BusinessModel, LicenseDocumentModel } from '../vendors/vendors.model';
 import { LiveSessionModel } from '../livemap/livemap.model';
 import { TransactionModel } from '../payments/payments.model';
@@ -55,6 +55,57 @@ export const adminService = {
       UserModel.countDocuments({ created_at: { $gte: since } }).exec(),
     ]);
 
+    /**
+     * Yesterday, over the same elapsed window.
+     *
+     * A dashboard that says "$12.80" tells an operator nothing — they cannot know whether that is a
+     * good morning or a collapse. The comparison is the entire informational content of a daily
+     * number, and it was missing.
+     *
+     * Compared like-for-like: today at 10am is measured against yesterday UP TO 10am, not against
+     * yesterday's full total. Otherwise every morning reports a catastrophic decline that corrects
+     * itself by evening, and an operator learns to ignore the number — which is worse than not
+     * showing it.
+     *
+     * Only FLOW metrics get a comparison. Live sessions and active vendors are counts of what is
+     * true right now; "yesterday's live sessions" is not a meaningful quantity, and inventing one
+     * would put a trend arrow on a number that cannot trend.
+     */
+    const dayMs = 24 * 60 * 60 * 1000;
+    const yesterdayStart = new Date(since.getTime() - dayMs);
+    const yesterdaySameTime = new Date(Date.now() - dayMs);
+
+    const [gmvYesterdayAgg, ordersYesterday, signupsYesterday, pendingVerifications, activity] =
+      await Promise.all([
+        TransactionModel.aggregate<{ _id: null; total: number }>([
+          {
+            $match: {
+              status: 'completed',
+              completed_at: { $gte: yesterdayStart, $lt: yesterdaySameTime },
+            },
+          },
+          { $group: { _id: null, total: { $sum: '$amount_cents' } } },
+        ]).exec(),
+        OrderModel.countDocuments({
+          created_at: { $gte: yesterdayStart, $lt: yesterdaySameTime },
+        }).exec(),
+        UserModel.countDocuments({
+          created_at: { $gte: yesterdayStart, $lt: yesterdaySameTime },
+        }).exec(),
+        VerificationRecordModel.countDocuments({ status: 'pending' }).exec(),
+        /**
+         * A real activity feed, from the audit log that every consequential action already writes
+         * to. Not a decorative "recent events" strip: these are the same rows an investigator would
+         * read, so a row can lead somewhere real rather than nowhere.
+         */
+        AuditLogModel.find({})
+          .sort({ created_at: -1 })
+          .limit(8)
+          .select('action entityType entityId actorId created_at')
+          .lean()
+          .exec(),
+      ]);
+
     return {
       city: cityDoc?.name ?? 'Modesto, CA',
       liveSessions,
@@ -64,7 +115,20 @@ export const adminService = {
       openDisputes,
       fraudFlags,
       pendingLicenses,
+      pendingVerifications,
       newSignups,
+      /** Same window yesterday — null-free, and only for metrics where a trend means something. */
+      previous: {
+        gmvCents: gmvYesterdayAgg[0]?.total ?? 0,
+        orders: ordersYesterday,
+        newSignups: signupsYesterday,
+      },
+      activity: activity.map((a) => ({
+        action: a.action,
+        entityType: a.entityType ?? null,
+        entityId: a.entityId ?? null,
+        at: a.created_at,
+      })),
     };
   },
 
