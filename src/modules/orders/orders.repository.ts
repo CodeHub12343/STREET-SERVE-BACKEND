@@ -35,6 +35,8 @@ export const ordersRepository = {
     service_fee_cents: number;
     processing_fee_cents: number;
     pay_it_forward_cents?: number;
+    pay_it_forward_redemption_id?: string | null;
+    status?: string;
     tip_cents: number;
     round_up_cents: number;
     total_cents: number;
@@ -64,10 +66,15 @@ export const ordersRepository = {
       .lean()
       .exec();
   },
+  /**
+   * The vendor's queue. `pending_payment` is EXCLUDED whatever is asked for: an order whose card has
+   * not cleared is not a job, and showing one let a vendor accept it and start cooking for somebody
+   * who had not paid and might simply close the tab.
+   */
   listForBusiness(businessId: string, statuses: string[] | null, limit: number) {
     const filter = statuses
-      ? { business_id: businessId, status: { $in: statuses } }
-      : { business_id: businessId };
+      ? { business_id: businessId, status: { $in: statuses.filter((x) => x !== 'pending_payment') } }
+      : { business_id: businessId, status: { $ne: 'pending_payment' } };
     return OrderModel.find(filter).sort({ created_at: -1 }).limit(limit).lean().exec();
   },
 };

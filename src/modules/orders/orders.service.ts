@@ -383,30 +383,28 @@ export const ordersService = {
        */
       total_cents: breakdown.totalCents,
       pay_it_forward_cents: payItForwardCents,
+      pay_it_forward_redemption_id: reservation?.redemptionId ?? null,
       transaction_id: charge?.transactionId ?? null,
+      /**
+       * A card was opened but not confirmed, so this order does not exist as far as the vendor is
+       * concerned until it settles. A fully covered order took no card at all and is genuinely paid
+       * for already — the one case that goes straight into the queue.
+       */
+      status: charge ? 'pending_payment' : 'pending',
     });
+    const awaitingPayment = Boolean(charge);
 
-    // The payment has settled (or there was none to take), so the fund is genuinely spent now.
-    if (reservation?.redemptionId) {
-      await payforwardService.apply({
-        redemptionId: reservation.redemptionId,
-        orderId: String(order._id),
-        customerId: principal.userId,
-      });
-    }
-
-    notificationsService.notify(owner, {
-      category: 'order',
-      title: 'New order',
-      body: `${lineItems.length} item(s) for pickup`,
-      // `audience: 'vendor'` routes this to the vendor's order queue; customer order updates omit it.
-      data: { orderId: String(order._id), audience: 'vendor' },
-    });
-    await publish('order.placed', {
-      orderId: String(order._id),
-      businessId: input.businessId,
-      customerId: principal.userId,
-    });
+    /**
+     * ═══ Nothing below happens until the money is real. ═══
+     *
+     * Spending the community fund, telling the vendor, and announcing the order were all done here
+     * — before the customer had entered a card. The vendor got "New order" for something that might
+     * never be paid for, and the fund was drawn down against a charge that had only been opened.
+     *
+     * `confirmByPaymentIntent` does all three when the payment settles. A fully covered order has
+     * nothing left to collect, so it is announced right here, which is the only honest exception.
+     */
+    if (!awaitingPayment) await this.announcePlaced(order, reservation?.redemptionId ?? null);
     return {
       ...this.view(order),
       payment: charge,
@@ -659,6 +657,103 @@ export const ordersService = {
       created_at: { $gte: from },
       status: { $ne: 'cancelled' },
     }).exec();
+  },
+
+  /**
+   * An order becomes REAL: the fund is spent, the vendor is told, and the platform announces it.
+   *
+   * Split out because it now has two callers that are genuinely different moments — a fully covered
+   * order, which owes nothing and is real immediately, and a card order, which is real only once
+   * Stripe says so.
+   */
+  async announcePlaced(order: { _id: unknown; business_id: string; customer_id: string; items?: unknown[] }, redemptionId: string | null) {
+    const orderId = String(order._id);
+    if (redemptionId) {
+      await payforwardService.apply({
+        redemptionId,
+        orderId,
+        customerId: order.customer_id,
+      });
+    }
+    const owner = await vendorsService.getBusinessOwner(order.business_id);
+    if (owner) {
+      notificationsService.notify(owner, {
+        category: 'order',
+        title: 'New order',
+        body: `${order.items?.length ?? 0} item(s) for pickup`,
+        // `audience: 'vendor'` routes this to the vendor's order queue; customer updates omit it.
+        data: { orderId, audience: 'vendor' },
+      });
+    }
+    await publish('order.placed', {
+      orderId,
+      businessId: order.business_id,
+      customerId: order.customer_id,
+    });
+  },
+
+  /**
+   * The card cleared. Driven by `payment_intent.succeeded`.
+   *
+   * The guarded transition IS the idempotency: only a `pending_payment` order moves, so a duplicate
+   * webhook delivery cannot notify the vendor twice or spend the community fund twice.
+   */
+  async confirmByPaymentIntent(paymentIntentRef: string): Promise<{ handled: boolean }> {
+    const txn = await paymentsService.findTransactionByPaymentIntent(paymentIntentRef);
+    if (!txn) return { handled: false };
+
+    const order = await OrderModel.findOne({
+      transaction_id: String(txn._id),
+      status: 'pending_payment',
+    }).lean().exec();
+    if (!order) return { handled: false }; // not an order charge, or already confirmed
+
+    const claimed = await repo.transition(String(order._id), 'pending_payment', {
+      status: 'pending',
+    });
+    if (!claimed) return { handled: true }; // a concurrent delivery won the race
+
+    await this.announcePlaced(order, order.pay_it_forward_redemption_id ?? null);
+    await paymentsService.completeByPaymentIntent(paymentIntentRef);
+    return { handled: true };
+  },
+
+  /**
+   * The card failed. The order is cancelled rather than left in `pending_payment` for ever, and any
+   * community-fund reservation goes straight back to the pool — money held against an order that
+   * will never happen is money withheld from someone who could have used it.
+   */
+  async failByPaymentIntent(paymentIntentRef: string, reason: string): Promise<{ handled: boolean }> {
+    const txn = await paymentsService.findTransactionByPaymentIntent(paymentIntentRef);
+    if (!txn) return { handled: false };
+
+    const order = await OrderModel.findOne({
+      transaction_id: String(txn._id),
+      status: 'pending_payment',
+    }).lean().exec();
+    if (!order) return { handled: false };
+
+    const cancelled = await repo.transition(String(order._id), 'pending_payment', {
+      status: 'cancelled',
+      cancel_reason: reason,
+    });
+    if (!cancelled) return { handled: true };
+
+    /**
+     * Hand the community money straight back. A reservation held against an order that will never
+     * happen is money withheld from someone who could have used it today.
+     */
+    if (order.pay_it_forward_redemption_id) {
+      await payforwardService.release(order.pay_it_forward_redemption_id, 'payment_failed');
+    }
+
+    this.notifyCustomer(
+      order.customer_id,
+      String(order._id),
+      'cancelled',
+      'Your payment didn’t go through, so this order wasn’t placed. Nothing has been charged.',
+    );
+    return { handled: true };
   },
 
   async listForBusiness(

@@ -12,7 +12,19 @@ const OrderSchema = new Schema(
     business_id: { type: String, required: true },
     status: {
       type: String,
-      enum: ['pending', 'accepted', 'ready', 'completed', 'cancelled'],
+      /**
+       * `pending_payment` — created, card not yet confirmed.
+       *
+       * There was no such state. An order went straight to `pending` the moment it was placed, the
+       * vendor was notified "New order", and the customer was THEN sent to a payment screen. So a
+       * vendor could see an order in their queue, accept it and start cooking for someone who had
+       * not paid and might simply close the tab — and an abandoned checkout sat in that queue for
+       * ever, indistinguishable from a real one.
+       *
+       * `pending` now means "paid for, waiting on the vendor", which is what every downstream
+       * transition already assumed it meant.
+       */
+      enum: ['pending_payment', 'pending', 'accepted', 'ready', 'completed', 'cancelled'],
       default: 'pending',
     },
     /**
@@ -85,6 +97,14 @@ const OrderSchema = new Schema(
      * else. Conflating the two would understate the sale and misreport what the customer was given.
      */
     pay_it_forward_cents: { type: Number, default: 0 },
+    /**
+     * The community-fund reservation this order is holding, kept until the payment settles.
+     *
+     * The fund used to be SPENT at placement, before the card was confirmed. Deferring that means
+     * the reservation has to survive the wait, and it cannot be found from the redemption side —
+     * `apply` is what writes the order id onto it, and `apply` is precisely what is being deferred.
+     */
+    pay_it_forward_redemption_id: { type: String, default: null },
     tip_cents: { type: Number, default: 0 },
     round_up_cents: { type: Number, default: 0 },
     total_cents: { type: Number, required: true },

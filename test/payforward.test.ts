@@ -137,6 +137,33 @@ async function contributeAndSettle(
   return res;
 }
 
+/**
+ * Settle an order's card, exactly as the Stripe webhook does.
+ *
+ * Placing an order only OPENS the charge now — the vendor is not told and the community fund is not
+ * spent until the money actually arrives — so any test that wants a LIVE order has to settle it,
+ * just as a real customer completing the payment screen would. A no-op for a fully covered order,
+ * which takes no card at all and is live the moment it is placed.
+ */
+async function settleOrder(orderId: string): Promise<boolean> {
+  const order = await OrderModel.findById(orderId).lean();
+  if (!order?.transaction_id) return false;
+  const txn = await TransactionModel.findById(order.transaction_id).lean();
+  if (!txn?.payment_intent_ref) return false;
+  await request(app)
+    .post('/webhooks/stripe')
+    .set('stripe-signature', 'test')
+    .set('content-type', 'application/json')
+    .send(
+      JSON.stringify({
+        id: `evt_${Math.random()}`,
+        type: 'payment_intent.succeeded',
+        data: { object: { id: txn.payment_intent_ref } },
+      }),
+    );
+  return true;
+}
+
 /** Place an order. Module-scoped: the refund and abandonment tests need it too. */
 function placeOrder(token: string, body: object, key: string) {
   return request(app)
@@ -443,7 +470,7 @@ describe('3a · a pool rises only when money actually arrives', () => {
     const res = await contributeAndSettle(giver, v.businessId, 300, 'pf_allspent_1');
     const contributionId = res.body.data.contributionId as string;
 
-    await placeOrder(
+    const placed = await placeOrder(
       buyer,
       {
         businessId: v.businessId,
@@ -452,6 +479,8 @@ describe('3a · a pool rises only when money actually arrives', () => {
       },
       'pf_allspent_order',
     );
+    // The gift is consumed when the card clears, not when the order is placed.
+    await settleOrder(placed.body.data.id as string);
     expect(
       (await CommunityContributionModel.findById(contributionId).lean())!.remaining_cents,
     ).toBe(0);
@@ -1023,11 +1052,13 @@ describe('3b · redemption, caps and the daily limit', () => {
     const order = await OrderModel.findById(orderId).lean();
     expect(order!.transaction_id).toEqual(expect.any(String));
 
-    // The customer DID pay; the vendor simply has not accepted yet.
-    await TransactionModel.updateOne(
-      { _id: order!.transaction_id },
-      { $set: { status: 'completed' } },
-    );
+    /**
+     * The customer DID pay; the vendor simply has not accepted yet. Settled through the webhook
+     * rather than by writing `completed` onto the transaction, because that is now the thing that
+     * makes an order real — it is what moves it out of `pending_payment`, tells the vendor and
+     * spends the fund. Faking the row would test a state the product can no longer reach.
+     */
+    expect(await settleOrder(orderId)).toBe(true);
     await OrderModel.collection.updateOne(
       { _id: order!._id },
       { $set: { created_at: new Date(Date.now() - 60 * 60_000) } },
@@ -1277,5 +1308,148 @@ describe('3d · expiry, the ledger, and what the product may not claim', () => {
     const body = (res.body.data.body as string).toLowerCase();
     expect(body).toContain('not tax-deductible');
     expect(body).not.toMatch(/\bis tax-deductible\b/);
+  });
+});
+
+/**
+ * ═══ A VENDOR MUST NOT BE ASKED TO COOK FOR SOMEONE WHO HAS NOT PAID. ═══
+ *
+ * Placing an order went straight to `pending`, notified the vendor "New order", published
+ * `order.placed` and SPENT the community fund — and only then sent the customer to a payment
+ * screen. So a vendor saw an order in their queue and could accept it and start work for a
+ * customer who had not paid and might simply close the tab; the fund was drawn down against a
+ * charge that had only been opened; and an abandoned checkout sat in that queue for ever,
+ * indistinguishable from a real order.
+ */
+describe('an order is not real until the card clears', () => {
+  /** Deliver a Stripe event exactly as the webhook receives it. */
+  function stripeEvent(type: string, object: Record<string, unknown>) {
+    return request(app)
+      .post('/webhooks/stripe')
+      .set('stripe-signature', 'test')
+      .set('content-type', 'application/json')
+      .send(JSON.stringify({ id: `evt_${Math.random()}`, type, data: { object } }));
+  }
+
+  /** The pool balance, read straight from the projection. */
+  async function fundBalance(businessId: string): Promise<number> {
+    const fund = await CommunityFundModel.findOne({ business_id: businessId }).lean();
+    return fund?.balance_cents ?? 0;
+  }
+
+  it('keeps an unpaid order out of the vendor’s queue, then puts it in when the card clears', async () => {
+    const v = await vendorWithMenu('ord-unpaid');
+    const custToken = await customer('ord-unpaid');
+
+    const res = await placeOrder(
+      custToken,
+      { businessId: v.businessId, items: [{ menuItemId: v.menuItemId, quantity: 1 }] },
+      'ord-unpaid-1',
+    );
+    expect(res.status).toBe(201);
+    const orderId = res.body.data.id as string;
+
+    // ── Created, charge opened, nothing else. ──
+    const created = await OrderModel.findById(orderId).lean();
+    expect(created!.status).toBe('pending_payment');
+
+    // The vendor's queue does not show it — it is not a job yet.
+    const queueBefore = await request(app)
+      .get(`/api/v1/businesses/${v.businessId}/orders`)
+      .set(...bearer(v.token));
+    expect(queueBefore.status).toBe(200);
+    expect((queueBefore.body.data as { id: string }[]).some((o) => o.id === orderId)).toBe(false);
+
+    // ── The card clears. NOW it is an order. ──
+    const txn = await TransactionModel.findById(created!.transaction_id).lean();
+    await stripeEvent('payment_intent.succeeded', { id: txn!.payment_intent_ref });
+
+    const confirmed = await OrderModel.findById(orderId).lean();
+    expect(confirmed!.status).toBe('pending');
+
+    const queueAfter = await request(app)
+      .get(`/api/v1/businesses/${v.businessId}/orders`)
+      .set(...bearer(v.token));
+    expect((queueAfter.body.data as { id: string }[]).some((o) => o.id === orderId)).toBe(true);
+  });
+
+  /**
+   * The fund is the sharper half. Spending it at placement drew real money out of a community pool
+   * against a card that had only been opened — so an abandoned checkout took a meal away from
+   * somebody else and gave it to nobody.
+   */
+  it('does not spend the community fund until the card clears', async () => {
+    const v = await vendorWithMenu('ord-fund', { payForward: true });
+    const giverToken = await customer('ord-fund-giver');
+    // Deliberately partial: a fully covered order takes no card and is correctly live immediately.
+    await contributeAndSettle(giverToken, v.businessId, 100, 'ord-fund-contrib');
+
+    const custToken = await customer('ord-fund-buyer');
+    expect(await fundBalance(v.businessId)).toBe(100);
+
+    const res = await placeOrder(
+      custToken,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'ord-fund-1',
+    );
+    expect(res.status).toBe(201);
+
+    /**
+     * Reserved, not spent. The balance is held down so two people cannot claim the same money, but
+     * the redemption is not applied and the ledger has not posted.
+     */
+    const order = await OrderModel.findById(res.body.data.id).lean();
+    expect(order!.status).toBe('pending_payment');
+    expect(order!.pay_it_forward_redemption_id).toEqual(expect.any(String));
+
+    const redemption = await CommunityRedemptionModel.findById(
+      order!.pay_it_forward_redemption_id,
+    ).lean();
+    expect(redemption!.status).toBe('reserved');
+
+    // ── The card clears → the fund is genuinely spent. ──
+    const txn = await TransactionModel.findById(order!.transaction_id).lean();
+    await stripeEvent('payment_intent.succeeded', { id: txn!.payment_intent_ref });
+
+    const applied = await CommunityRedemptionModel.findById(
+      order!.pay_it_forward_redemption_id,
+    ).lean();
+    expect(applied!.status).toBe('applied');
+  });
+
+  /** A declined card must return the community's money rather than stranding it. */
+  it('cancels the order and returns the fund when the card is declined', async () => {
+    const v = await vendorWithMenu('ord-decline', { payForward: true });
+    const giverToken = await customer('ord-decline-giver');
+    await contributeAndSettle(giverToken, v.businessId, 100, 'ord-decline-contrib');
+
+    const custToken = await customer('ord-decline-buyer');
+    const res = await placeOrder(
+      custToken,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'ord-decline-1',
+    );
+    const order = await OrderModel.findById(res.body.data.id).lean();
+    const held = await fundBalance(v.businessId);
+
+    const txn = await TransactionModel.findById(order!.transaction_id).lean();
+    await stripeEvent('payment_intent.payment_failed', {
+      id: txn!.payment_intent_ref,
+      last_payment_error: { message: 'card_declined' },
+    });
+
+    const cancelled = await OrderModel.findById(order!._id).lean();
+    expect(cancelled!.status).toBe('cancelled');
+
+    // Back in the pool, available to the next person.
+    expect(await fundBalance(v.businessId)).toBeGreaterThan(held);
   });
 });

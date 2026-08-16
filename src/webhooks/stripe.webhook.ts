@@ -12,6 +12,7 @@ import { adsService } from '../modules/ads/ads.service';
 import { payforwardService } from '../modules/payforward/payforward.service';
 import { postcardsService } from '../modules/postcards/postcards.service';
 import { sponsorsService } from '../modules/sponsors/sponsors.service';
+import { ordersService } from '../modules/orders/orders.service';
 import { rtoService } from '../modules/rto/rto.service';
 import { subscriptionsService } from '../modules/subscriptions/subscriptions.service';
 import { boostService } from '../modules/boost/boost.service';
@@ -82,6 +83,11 @@ stripeWebhookRouter.post(
         // card that was never confirmed.
         const rto = await rtoService.creditByPaymentIntent(String(obj.id));
         if (rto.handled) break;
+        // An order. The vendor is told, and the community fund is spent, HERE and nowhere else —
+        // placing an order only opens the charge, so a vendor is never asked to cook for someone
+        // who has not paid.
+        const order = await ordersService.confirmByPaymentIntent(String(obj.id));
+        if (order.handled) break;
         await paymentsService.completeByPaymentIntent(String(obj.id));
         break;
       }
@@ -109,6 +115,10 @@ stripeWebhookRouter.post(
         // A placement left pending for ever is indistinguishable from one still being paid for.
         const failedSponsor = await sponsorsService.failByPaymentIntent(String(obj.id), reason);
         if (failedSponsor.handled) break;
+        // An order left at `pending_payment` for ever is indistinguishable from one still checking
+        // out, and it holds community-fund money that somebody else could have used today.
+        const failedOrder = await ordersService.failByPaymentIntent(String(obj.id), reason);
+        if (failedOrder.handled) break;
         await paymentsService.failByPaymentIntent(String(obj.id));
         break;
       }
