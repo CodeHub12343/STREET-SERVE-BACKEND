@@ -1787,3 +1787,40 @@ export const RESIDENT_STARTER_GRANT_LIMIT = 1; // one per resident, per shelter
  * moment.
  */
 export const AI_FREE_REQUESTS_PER_MONTH = 5;
+
+/**
+ * ═══ SPONSORSHIP TIERS (self-serve) ═══
+ *
+ * Priced in code rather than the fee registry: the registry prices a RATE applied to somebody
+ * else's transaction, whereas this is a product with a list price, and folding it in would let a
+ * fee-schedule edit silently change what a sponsor is charged mid-term.
+ *
+ * A sponsor picks a tier and a term; the price is `monthly_cents × months`. The server re-derives
+ * it from this table on every purchase — a client that could name its own price could sponsor the
+ * platform for a cent.
+ */
+export const SPONSOR_TIERS = [
+  {
+    slug: 'community',
+    name: 'Community',
+    monthlyCents: 9_900,
+    blurb: 'Your logo on the StreetServe landing page, and a link that tracks every signup it sends us.',
+  },
+  {
+    slug: 'launch',
+    name: 'Launch partner',
+    monthlyCents: 29_900,
+    blurb: 'Everything in Community, with larger placement and a named launch-partner lockup.',
+  },
+  {
+    slug: 'founding',
+    name: 'Founding partner',
+    monthlyCents: 99_900,
+    blurb: 'Top placement, named as a founding partner, and a monthly report on reach and signups.',
+  },
+] as const;
+
+export type SponsorTierSlug = (typeof SPONSOR_TIERS)[number]['slug'];
+
+/** The terms a sponsor may buy. Longer terms exist so a sponsor is not re-billed every month. */
+export const SPONSOR_TERM_MONTHS = [1, 3, 6, 12] as const;

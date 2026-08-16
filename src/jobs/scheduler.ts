@@ -179,6 +179,16 @@ export async function registerScheduledJobs(connection: Redis): Promise<void> {
     { repeat: { every: 86_400_000 }, jobId: 'payforward-expiry', removeOnComplete: true },
   );
   await sweeps.add(
+    'sponsor-expiry',
+    {},
+    /**
+     * Daily. A sponsorship term is measured in months, so a tighter cadence would only rediscover
+     * the same nothing — but it must exist at all: without it a paid placement stays on the landing
+     * page for ever and keeps attributing signups after the term it was paid for has ended.
+     */
+    { repeat: { every: 86_400_000 }, jobId: 'sponsor-expiry', removeOnComplete: true },
+  );
+  await sweeps.add(
     'payforward-expiry-notice',
     {},
     { repeat: { every: 86_400_000 }, jobId: 'payforward-expiry-notice', removeOnComplete: true },

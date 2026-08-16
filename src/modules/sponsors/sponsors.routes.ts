@@ -3,6 +3,7 @@ import { z } from 'zod';
 
 import { authenticate } from '../../middleware/auth';
 import { asyncHandler } from '../../middleware/asyncHandler';
+import { idempotency } from '../../middleware/idempotency';
 import { rateLimit } from '../../middleware/rateLimit';
 import { requirePermission } from '../../middleware/rbac';
 import { body, params, validate } from '../../middleware/validate';
@@ -35,6 +36,49 @@ sponsorsPublicRouter.post(
     ok(
       res,
       await sponsorsService.recordImpression(body<z.infer<typeof ImpressionBody>>(req).utmCode),
+    );
+  }),
+);
+
+/** The public rate card. Priced in code, so a sponsor and the server never disagree on the price. */
+sponsorsPublicRouter.get(
+  '/tiers',
+  rateLimit('read'),
+  asyncHandler(async (_req: Request, res: Response) => {
+    ok(res, sponsorsService.listTiers());
+  }),
+);
+
+/**
+ * Buy a placement. Opens a Stripe charge and returns its client secret — it publishes NOTHING.
+ *
+ * Authenticated on purpose: a sponsorship has an owner who must be told when it goes live, when it
+ * is refused, and when the term ends, and an anonymous buyer can be told none of those things.
+ */
+const PurchaseBody = z
+  .object({
+    name: z.string().min(1).max(160),
+    tier: z.string().min(1).max(40),
+    termMonths: z.number().int().min(1).max(24),
+    logoUrl: z.string().url().max(2048).optional(),
+    contactEmail: z.string().email(),
+    launchCitySlug: z.string().max(64).optional(),
+  })
+  .strict();
+sponsorsPublicRouter.post(
+  '/purchase',
+  rateLimit('write'),
+  authenticate,
+  idempotency,
+  validate({ body: PurchaseBody }),
+  asyncHandler(async (req: Request, res: Response) => {
+    created(
+      res,
+      await sponsorsService.purchase(
+        principal(req),
+        body<z.infer<typeof PurchaseBody>>(req),
+        req.header('Idempotency-Key') ?? '',
+      ),
     );
   }),
 );
@@ -140,6 +184,59 @@ sponsorsAdminRouter.patch(
         body<z.infer<typeof UpdateSponsorBody>>(req),
       ),
     );
+  }),
+);
+
+/**
+ * Approve a paid placement. THIS is what puts a logo on the landing page — not the payment.
+ * Publishing on payment alone would let anyone with a card put an arbitrary image on the site.
+ */
+sponsorsAdminRouter.post(
+  '/sponsors/:id/approve',
+  rateLimit('write'),
+  authenticate,
+  requirePermission('admin:manage_sponsors'),
+  validate({ params: IdParam }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(res, await sponsorsService.approve(principal(req), params<z.infer<typeof IdParam>>(req).id));
+  }),
+);
+
+/** Refuse a placement, refunding it. A reason is REQUIRED — the sponsor is told what it was. */
+const RejectBody = z.object({ reason: z.string().min(3).max(300) }).strict();
+sponsorsAdminRouter.post(
+  '/sponsors/:id/reject',
+  rateLimit('write'),
+  authenticate,
+  requirePermission('admin:manage_sponsors'),
+  validate({ params: IdParam, body: RejectBody }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(
+      res,
+      await sponsorsService.reject(
+        principal(req),
+        params<z.infer<typeof IdParam>>(req).id,
+        body<z.infer<typeof RejectBody>>(req).reason,
+      ),
+    );
+  }),
+);
+
+/**
+ * The waitlist. It was writable by the public and readable by nothing — the only endpoint was a
+ * bare count — so every lead the landing page collected, including would-be sponsors, landed in a
+ * collection no screen exposed.
+ */
+const PreregQuery = z.object({ intendedRole: z.string().max(32).optional() }).strict();
+sponsorsAdminRouter.get(
+  '/preregistrations',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('admin:manage_sponsors'),
+  validate({ query: PreregQuery }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = req.query as z.infer<typeof PreregQuery>;
+    ok(res, await sponsorsService.listPreregistrations(q.intendedRole ? { intendedRole: q.intendedRole } : {}));
   }),
 );
 

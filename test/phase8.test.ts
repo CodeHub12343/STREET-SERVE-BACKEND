@@ -1,10 +1,27 @@
 import request from 'supertest';
-import { describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 
 import { createApp } from '../src/app';
+import { setStripeGateway } from '../src/integrations/stripe';
 import { isFinalAttempt } from '../src/jobs/financial';
 import { CityModel } from '../src/modules/catalog/catalog.model';
+import { SponsorModel } from '../src/modules/sponsors/sponsors.model';
+import { sponsorsService } from '../src/modules/sponsors/sponsors.service';
 import { bearer, mintToken, seedUser } from './helpers';
+import { FakeStripeGateway } from './fakes';
+
+/** Sponsorship is bought with a card, so this suite needs a gateway that can take one. */
+const fakeStripe = new FakeStripeGateway();
+beforeAll(() => setStripeGateway(fakeStripe));
+
+/** Deliver a Stripe event, exactly as the webhook would receive it. */
+function stripeEvent(type: string, object: Record<string, unknown>) {
+  return request(app)
+    .post('/webhooks/stripe')
+    .set('stripe-signature', 'test')
+    .set('content-type', 'application/json')
+    .send(JSON.stringify({ id: `evt_${Math.random()}`, type, data: { object } }));
+}
 
 /**
  * Phase 8 — Launch hardening: observability metrics exposed, financial retry/DLQ policy, sponsor
@@ -149,6 +166,215 @@ describe('sponsors: the admin roster and ending a sponsorship', () => {
     const vendor = await mintToken('p8auth|vendor');
     const list = await request(app).get('/api/v1/admin/sponsors').set(...bearer(vendor));
     expect([401, 403]).toContain(list.status);
+  });
+});
+
+/**
+ * SELF-SERVE SPONSORSHIP.
+ *
+ * A sponsor could not sponsor StreetServe at all: the whole feature was admin record-keeping for a
+ * deal closed by email, and the landing page's "Partner with us" link was a `mailto:`.
+ *
+ * The rule that shapes every test here: **paying does not publish a logo.** Anyone with a card
+ * could otherwise put an arbitrary image on the landing page, so the money is taken first and a
+ * person approves the image before it appears.
+ */
+describe('sponsors: buying a placement', () => {
+  async function buyer(prefix: string) {
+    await seedUser({ authProviderId: `${prefix}|sponsor`, roles: ['customer'] });
+    return mintToken(`${prefix}|sponsor`);
+  }
+
+  function purchase(token: string, key: string, over: Record<string, unknown> = {}) {
+    return request(app)
+      .post('/api/v1/sponsors/purchase')
+      .set(...bearer(token))
+      .set('Idempotency-Key', key)
+      .send({
+        name: 'Valley Credit Union',
+        tier: 'launch',
+        termMonths: 3,
+        contactEmail: 'ops@vcu.test',
+        logoUrl: 'https://cdn.test/vcu.png',
+        ...over,
+      });
+  }
+
+  it('publishes the rate card, and prices the term server-side', async () => {
+    const tiers = await request(app).get('/api/v1/sponsors/tiers');
+    expect(tiers.status).toBe(200);
+    expect(tiers.body.data.tiers.length).toBeGreaterThan(0);
+
+    const token = await buyer('sp-price');
+    const res = await purchase(token, 'sp-price-1');
+    expect(res.status).toBe(201);
+    // launch = $299/mo x 3 months. The client never names a price.
+    expect(res.body.data.amountCents).toBe(89_700);
+    expect(res.body.data.clientSecret).toEqual(expect.any(String));
+    expect(res.body.data.status).toBe('pending_payment');
+  });
+
+  it('does not put a logo on the landing page until the money arrives AND a person approves', async () => {
+    const token = await buyer('sp-flow');
+    const res = await purchase(token, 'sp-flow-1', { name: 'Unapproved Co' });
+    const sponsorId = res.body.data.id as string;
+
+    // ── Paid for, not yet reviewed. Still not public. ──
+    const notLiveYet = await request(app).get('/api/v1/sponsors');
+    expect((notLiveYet.body.data as { name: string }[]).some((x) => x.name === 'Unapproved Co')).toBe(
+      false,
+    );
+
+    const row = await SponsorModel.findById(sponsorId).lean();
+    expect(row!.status).toBe('pending_payment');
+    expect(row!.active).toBe(false);
+
+    // ── The card clears. Moves to REVIEW — still not live. ──
+    await stripeEvent('payment_intent.succeeded', { id: row!.pending_intent_ref });
+    const paid = await SponsorModel.findById(sponsorId).lean();
+    expect(paid!.status).toBe('pending_review');
+    expect(paid!.active).toBe(false);
+    expect(paid!.paid_cents).toBe(89_700);
+
+    const stillNotLive = await request(app).get('/api/v1/sponsors');
+    expect(
+      (stillNotLive.body.data as { name: string }[]).some((x) => x.name === 'Unapproved Co'),
+    ).toBe(false);
+
+    // ── A person approves. NOW the logo is live. ──
+    await seedUser({ authProviderId: 'sp-flow|admin', roles: ['admin'] });
+    const admin = await mintToken('sp-flow|admin');
+    const approve = await request(app)
+      .post(`/api/v1/admin/sponsors/${sponsorId}/approve`)
+      .set(...bearer(admin));
+    expect(approve.status).toBe(200);
+    expect(approve.body.data.active).toBe(true);
+    // The term starts at approval, not at payment — otherwise a slow review silently eats days.
+    expect(new Date(approve.body.data.endsAt).getTime()).toBeGreaterThan(Date.now());
+
+    const live = await request(app).get('/api/v1/sponsors');
+    expect((live.body.data as { name: string }[]).some((x) => x.name === 'Unapproved Co')).toBe(true);
+  });
+
+  it('cannot approve a placement that was never paid for', async () => {
+    const token = await buyer('sp-unpaid');
+    const res = await purchase(token, 'sp-unpaid-1', { name: 'Never Paid Co' });
+
+    await seedUser({ authProviderId: 'sp-unpaid|admin', roles: ['admin'] });
+    const admin = await mintToken('sp-unpaid|admin');
+    const approve = await request(app)
+      .post(`/api/v1/admin/sponsors/${res.body.data.id}/approve`)
+      .set(...bearer(admin));
+    expect(approve.status).toBe(409);
+    expect(approve.body.error.message).toMatch(/not been paid for/i);
+  });
+
+  it('refunds when a logo is refused, and never publishes it', async () => {
+    const token = await buyer('sp-reject');
+    const res = await purchase(token, 'sp-reject-1', { name: 'Rejected Co' });
+    const sponsorId = res.body.data.id as string;
+    const row = await SponsorModel.findById(sponsorId).lean();
+    await stripeEvent('payment_intent.succeeded', { id: row!.pending_intent_ref });
+
+    await seedUser({ authProviderId: 'sp-reject|admin', roles: ['admin'] });
+    const admin = await mintToken('sp-reject|admin');
+    const reject = await request(app)
+      .post(`/api/v1/admin/sponsors/${sponsorId}/reject`)
+      .set(...bearer(admin))
+      .send({ reason: 'The logo is not yours to use' });
+    expect(reject.status).toBe(200);
+    // Refusing a logo while keeping the money would be indefensible.
+    expect(reject.body.data.refunded).toBe(true);
+
+    const after = await SponsorModel.findById(sponsorId).lean();
+    expect(after!.status).toBe('rejected');
+    expect(after!.active).toBe(false);
+  });
+
+  it('takes the placement down when the term runs out', async () => {
+    const token = await buyer('sp-expire');
+    const res = await purchase(token, 'sp-expire-1', { name: 'Expiring Co', termMonths: 1 });
+    const sponsorId = res.body.data.id as string;
+    const row = await SponsorModel.findById(sponsorId).lean();
+    await stripeEvent('payment_intent.succeeded', { id: row!.pending_intent_ref });
+
+    await seedUser({ authProviderId: 'sp-expire|admin', roles: ['admin'] });
+    const admin = await mintToken('sp-expire|admin');
+    await request(app)
+      .post(`/api/v1/admin/sponsors/${sponsorId}/approve`)
+      .set(...bearer(admin))
+      .expect(200);
+
+    // Wind the term back past its end.
+    await SponsorModel.updateOne({ _id: sponsorId }, { $set: { ends_at: new Date(Date.now() - 1000) } });
+    expect(await sponsorsService.expireFinishedSponsorships()).toBeGreaterThanOrEqual(1);
+
+    const after = await SponsorModel.findById(sponsorId).lean();
+    expect(after!.status).toBe('expired');
+    // The logo is down AND the UTM stops attributing — the defect `active` had when nothing set it.
+    expect(after!.active).toBe(false);
+  });
+
+  it('rejects a tier or term the rate card does not offer', async () => {
+    const token = await buyer('sp-bad');
+    const badTier = await purchase(token, 'sp-bad-1', { tier: 'free-forever' });
+    expect(badTier.status).toBe(404);
+    const badTerm = await purchase(token, 'sp-bad-2', { termMonths: 7 });
+    expect([400, 409, 422]).toContain(badTerm.status);
+  });
+});
+
+/**
+ * The waitlist was writable by the public and readable by nothing — the only endpoint was a bare
+ * count — so every lead the landing page collected, including would-be sponsors, landed in a
+ * collection no screen exposed.
+ */
+describe('sponsors: the waitlist an operator can finally read', () => {
+  it('lists pre-registrations, filters by intended role, and names the referring sponsor', async () => {
+    await seedUser({ authProviderId: 'leads|admin', roles: ['admin'] });
+    const admin = await mintToken('leads|admin');
+
+    const create = await request(app)
+      .post('/api/v1/admin/sponsors')
+      .set(...bearer(admin))
+      .send({ name: 'Referrer Co', utmCode: 'leads-ref' });
+    expect(create.status).toBe(201);
+
+    await request(app)
+      .post('/api/v1/preregistrations')
+      .send({ fullName: 'Would Be Sponsor', email: 'lead-sponsor@example.com', intendedRole: 'sponsor', utmCode: 'leads-ref' })
+      .expect(201);
+    await request(app)
+      .post('/api/v1/preregistrations')
+      .send({ fullName: 'Just A Customer', email: 'lead-customer@example.com', intendedRole: 'customer' })
+      .expect(201);
+
+    const all = await request(app).get('/api/v1/admin/preregistrations').set(...bearer(admin));
+    expect(all.status).toBe(200);
+    expect(all.body.data.length).toBeGreaterThanOrEqual(2);
+
+    const sponsors = await request(app)
+      .get('/api/v1/admin/preregistrations?intendedRole=sponsor')
+      .set(...bearer(admin));
+    const lead = (sponsors.body.data as { email: string; sponsorName: string | null }[]).find(
+      (r) => r.email === 'lead-sponsor@example.com',
+    );
+    expect(lead).toBeTruthy();
+    // Resolved to a NAME — a raw sponsor id tells an operator nothing.
+    expect(lead!.sponsorName).toBe('Referrer Co');
+    expect(
+      (sponsors.body.data as { email: string }[]).some((r) => r.email === 'lead-customer@example.com'),
+    ).toBe(false);
+  });
+
+  it('keeps the waitlist admin-only — it is a list of names and emails', async () => {
+    await seedUser({ authProviderId: 'leads|vendor', roles: ['vendor'] });
+    const vendor = await mintToken('leads|vendor');
+    const res = await request(app).get('/api/v1/admin/preregistrations').set(...bearer(vendor));
+    expect([401, 403]).toContain(res.status);
+
+    const anon = await request(app).get('/api/v1/admin/preregistrations');
+    expect(anon.status).toBe(401);
   });
 });
 

@@ -24,6 +24,7 @@ import { debtService } from '../../modules/debt/debt.service';
 import { queueService } from '../../modules/queue/queue.service';
 import { schedulingService } from '../../modules/scheduling/scheduling.service';
 import { payforwardService } from '../../modules/payforward/payforward.service';
+import { sponsorsService } from '../../modules/sponsors/sponsors.service';
 import { boostService } from '../../modules/boost/boost.service';
 import { subscriptionsService } from '../../modules/subscriptions/subscriptions.service';
 import { deliveryService } from '../../modules/delivery/delivery.service';
@@ -224,6 +225,11 @@ export function startWorkers(redis: Redis): Worker[] {
           // Logs inside the service, and only when something actually changed — a sweep that finds
           // every subscription exactly as expected is the normal case and not worth a line.
           await subscriptionsService.reconcile();
+          break;
+        }
+        case 'sponsor-expiry': {
+          const n = await sponsorsService.expireFinishedSponsorships();
+          if (n) logger.info({ expired: n }, 'sponsor-expiry sweep');
           break;
         }
         case 'payforward-expiry': {

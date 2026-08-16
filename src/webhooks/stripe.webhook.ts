@@ -11,6 +11,7 @@ import { pingService } from '../modules/growth/ping.service';
 import { adsService } from '../modules/ads/ads.service';
 import { payforwardService } from '../modules/payforward/payforward.service';
 import { postcardsService } from '../modules/postcards/postcards.service';
+import { sponsorsService } from '../modules/sponsors/sponsors.service';
 import { rtoService } from '../modules/rto/rto.service';
 import { subscriptionsService } from '../modules/subscriptions/subscriptions.service';
 import { boostService } from '../modules/boost/boost.service';
@@ -71,6 +72,10 @@ stripeWebhookRouter.post(
         // nowhere else, so the books can never show a sale whose money has not arrived.
         const postcard = await postcardsService.completeByPaymentIntent(String(obj.id));
         if (postcard.handled) break;
+        // A self-serve sponsorship. Moves it to REVIEW, never straight to live: publishing on
+        // payment alone would let anyone with a card put an arbitrary image on the landing page.
+        const sponsorship = await sponsorsService.activateByPaymentIntent(String(obj.id));
+        if (sponsorship.handled) break;
         // A Rent-to-Own acceptance or early payoff. Ownership credit, the immutable ledger entry,
         // the consignment split and the ownership TRANSFER all happen here and nowhere else — the
         // accept/payoff endpoints only open the charge, so nobody gains equity in an item against a
@@ -101,6 +106,9 @@ stripeWebhookRouter.post(
         if (failedBoost.handled) break;
         const failedPostcard = await postcardsService.failByPaymentIntent(String(obj.id), reason);
         if (failedPostcard.handled) break;
+        // A placement left pending for ever is indistinguishable from one still being paid for.
+        const failedSponsor = await sponsorsService.failByPaymentIntent(String(obj.id), reason);
+        if (failedSponsor.handled) break;
         await paymentsService.failByPaymentIntent(String(obj.id));
         break;
       }
