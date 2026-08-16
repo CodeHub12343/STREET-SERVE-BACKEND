@@ -908,3 +908,50 @@ describe('delivery: dispatch waits for the customer to actually pay', () => {
     expect(res.body.error.message).toMatch(/not been paid for/i);
   });
 });
+
+/**
+ * ═══ WHAT A DELIVERY IS WORTH ═══
+ *
+ * The vendor typed a number into a box with fixed presets, so the offer bore no relation to the
+ * journey: the same amount for two streets and for five miles. Drivers decline the long ones, the
+ * customer waits, and nobody can see why.
+ *
+ * Computed, never negotiated. The customer has already paid at checkout, so a price haggled
+ * afterwards has no rail to collect it — and bartering while the food goes cold, with a driver able
+ * to hold an order hostage for more, is a worse deal for both sides than a number they can each see
+ * before anyone commits.
+ */
+describe('delivery: priced by distance, not by haggling', () => {
+  it('quotes more for a longer journey, and never outside the payout bounds', async () => {
+    const near = deliveryService.suggestedPayoutCents([-121.0, 37.6], [-121.002, 37.602]);
+    const far = deliveryService.suggestedPayoutCents([-121.0, 37.6], [-121.08, 37.66]);
+    expect(far).toBeGreaterThan(near);
+
+    // A journey across the street still pays enough to be worth turning up for…
+    expect(near).toBeGreaterThanOrEqual(200);
+    // …and an absurd one is capped rather than unbounded.
+    const absurd = deliveryService.suggestedPayoutCents([-121.0, 37.6], [-8.0, 52.0]);
+    expect(absurd).toBe(5_000);
+  });
+
+  it('quotes a real order from its actual pickup and drop-off', async () => {
+    const { token, orderId } = await vendorWithOrder('dan-quote');
+    const res = await request(app)
+      .get(`/api/v1/deliveries/quote/${orderId}`)
+      .set(...bearer(token));
+    expect(res.status).toBe(200);
+    expect(res.body.data.distanceM).toBeGreaterThan(0);
+    expect(res.body.data.suggestedPayoutCents).toBeGreaterThanOrEqual(200);
+    expect(res.body.data.suggestedPayoutCents).toBeLessThanOrEqual(5_000);
+  });
+
+  it('will not quote somebody else’s order', async () => {
+    const { orderId } = await vendorWithOrder('dan-quote-auth');
+    await seedUser({ authProviderId: 'dan-quote-auth|nosy', roles: ['vendor'] });
+    const nosy = await mintToken('dan-quote-auth|nosy');
+    const res = await request(app)
+      .get(`/api/v1/deliveries/quote/${orderId}`)
+      .set(...bearer(nosy));
+    expect([403, 404]).toContain(res.status);
+  });
+});

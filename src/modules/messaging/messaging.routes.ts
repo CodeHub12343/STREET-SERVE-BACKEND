@@ -48,7 +48,7 @@ messageThreadsRouter.post(
  */
 const OpenSubjectBody = z
   .object({
-    subjectType: z.enum(['consignment', 'job']),
+    subjectType: z.enum(['consignment', 'job', 'delivery']),
     subjectRefId: z.string().length(24),
   })
   .strict();

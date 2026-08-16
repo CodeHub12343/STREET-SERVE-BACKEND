@@ -525,6 +525,23 @@ export const DELIVERY_MIN_PAYOUT_CENTS = 200;
 export const DELIVERY_MAX_PAYOUT_CENTS = 5_000;
 
 /**
+ * ═══ WHAT A DELIVERY IS WORTH, BY DISTANCE ═══
+ *
+ * The vendor used to type a number into a box with fixed presets, so the offer bore no relation to
+ * how far the driver actually had to go: the same £5 for two streets and for five miles. Drivers
+ * decline the long ones, the customer waits, and nobody can see why.
+ *
+ * A base that covers turning up at all, plus a rate for the distance actually travelled. Both are
+ * floors under a negotiation that deliberately does not happen — see `delivery.service.ts` — so the
+ * driver knows the price before they commit and the customer is never bartered with mid-order.
+ *
+ * Deliberately conservative and easy to move: these two numbers are the whole pricing model, and
+ * they should be re-set once the pilot shows what a delivery really costs.
+ */
+export const DELIVERY_BASE_PAYOUT_CENTS = 300;
+export const DELIVERY_PER_KM_PAYOUT_CENTS = 120;
+
+/**
  * A-15 — how coarse a destination looks to a driver who has not accepted yet. ~800m is enough to
  * decide whether the trip is worth taking and not enough to identify a household.
  */

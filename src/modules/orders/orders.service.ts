@@ -246,12 +246,26 @@ export const ordersService = {
      * dispatch work in Phase 5, and until then the flag is all-or-nothing for the pilot city, which
      * is exactly how the pilot should run anyway.
      */
+    /**
+     * ═══ Delivery is now ON by default, everywhere. ═══
+     *
+     * This was default-DENY: a city had to be explicitly opened before anyone could order delivery,
+     * which is why no order in the product had ever been a delivery and the vendor's "Request a
+     * driver" button had never once rendered.
+     *
+     * Inverted at the product owner's decision, and recorded here because it reverses a deliberate
+     * control: the flag existed so delivery could be launched market by market as insurance and
+     * local rules were cleared. Default-allow means a city nobody has checked is open for business.
+     *
+     * A city can still be closed explicitly (`feature_flags.delivery === false`), so the switch has
+     * not been thrown away — it has changed which way it points.
+     */
     const destination = input.destination ?? null;
     if (destination) {
       const { platformService } = await import('../platform/platform.service');
-      if (!(await platformService.isFeatureExplicitlyEnabled(env.DEFAULT_CITY, 'delivery'))) {
+      if (await platformService.isFeatureExplicitlyDisabled(env.DEFAULT_CITY, 'delivery')) {
         throw ForbiddenError(
-          'Delivery is not available here yet — this order can be placed for pickup instead.',
+          'Delivery is switched off in this area — this order can be placed for pickup instead.',
           ERROR_CODES.FEATURE_DISABLED,
         );
       }

@@ -74,6 +74,18 @@ driversRouter.post(
 export const deliveryRouter = Router();
 
 /** The vendor asks for help. */
+/**
+ * What this delivery is worth, before anyone commits — computed from the real pickup→drop-off
+ * distance, so the vendor's offer reflects the journey rather than a number typed into a box.
+ */
+deliveryRouter.get(
+  '/quote/:orderId',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('delivery:request'),
+  asyncHandler(deliveryController.quote),
+);
+
 deliveryRouter.post(
   '/',
   rateLimit('write'),

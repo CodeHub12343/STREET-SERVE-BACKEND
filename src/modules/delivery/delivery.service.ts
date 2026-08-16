@@ -5,7 +5,9 @@ import {
   DELIVERY_BROADCAST_RADIUS_M,
   DELIVERY_COARSE_LOCATION_M,
   DELIVERY_MAX_BROADCASTS,
+  DELIVERY_BASE_PAYOUT_CENTS,
   DELIVERY_MAX_PAYOUT_CENTS,
+  DELIVERY_PER_KM_PAYOUT_CENTS,
   DELIVERY_MIN_PAYOUT_CENTS,
   DELIVERY_OFFER_TTL_SEC,
   DELIVERY_POSITION_MIN_INTERVAL_MS,
@@ -24,6 +26,7 @@ import {
   NotFoundError,
   ValidationError,
 } from '../../shared/errors/AppError';
+import { distanceMeters } from '../../shared/geo';
 import { formatCents } from '../../shared/money';
 import type { Principal } from '../../shared/types/principal';
 import { livemapRepository } from '../livemap/livemap.repository';
@@ -95,6 +98,62 @@ export const deliveryService = {
    * accepting would be the kind of control ADR-004 prohibits; the vendor knows what the trip is
    * worth to them, and the driver decides whether it is worth taking.
    */
+  /**
+   * ═══ What this delivery is worth, from the distance it actually covers. ═══
+   *
+   * The vendor typed a number into a box, so the offer bore no relation to the journey: the same
+   * amount for two streets and for five miles. Drivers decline the long ones and nobody can see
+   * why.
+   *
+   * Computed, not negotiated. The customer has already paid at checkout, so a price haggled
+   * afterwards has no rail to collect it — and bartering while the food goes cold, with a driver
+   * able to hold an order hostage for more, is a worse deal for both sides than a number they can
+   * each see up front. The vendor may still offer MORE (a heavy load, bad weather); they cannot
+   * offer less than this.
+   */
+  suggestedPayoutCents(pickup: [number, number], dropoff: [number, number]): number {
+    const km = distanceMeters(pickup, dropoff) / 1000;
+    const raw = DELIVERY_BASE_PAYOUT_CENTS + Math.round(km * DELIVERY_PER_KM_PAYOUT_CENTS);
+    // Rounded to 10p so the offer reads as a price rather than a computation.
+    const rounded = Math.round(raw / 10) * 10;
+    return Math.min(DELIVERY_MAX_PAYOUT_CENTS, Math.max(DELIVERY_MIN_PAYOUT_CENTS, rounded));
+  },
+
+  /**
+   * What a delivery would pay, before anyone commits — so the vendor's button can show the real
+   * number rather than a guess, and the driver is offered something that reflects the journey.
+   */
+  async quote(principal: Principal, orderId: string) {
+    const order = await OrderModel.findById(orderId).lean();
+    if (!order) throw NotFoundError('Order not found');
+    const owner = await vendorsService.getBusinessOwner(order.business_id);
+    if (owner !== principal.userId) {
+      throw ForbiddenError('You do not own this business', ERROR_CODES.NOT_OWNER);
+    }
+    // The address stores GeoJSON `location.coordinates` ([lng, lat]) — not flat lng/lat fields.
+    const dest = order.destination as { location?: { coordinates?: number[] } } | null;
+    const coords = dest?.location?.coordinates;
+    if (!coords || coords.length !== 2) {
+      throw BusinessRuleError(ERROR_CODES.BUSINESS_RULE, 'This order is not a delivery');
+    }
+    const dropoff: [number, number] = [coords[0]!, coords[1]!];
+    const session = await livemapRepository.findActiveByActor('business', order.business_id);
+    if (!session) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_AWAY,
+        'Go live before requesting a driver — they need somewhere to collect from',
+      );
+    }
+    const pickup = session.current_location!.coordinates as [number, number];
+    const distanceM = Math.round(distanceMeters(pickup, dropoff));
+    return {
+      distanceM,
+      suggestedPayoutCents: this.suggestedPayoutCents(pickup, dropoff),
+      minPayoutCents: DELIVERY_MIN_PAYOUT_CENTS,
+      maxPayoutCents: DELIVERY_MAX_PAYOUT_CENTS,
+    };
+  },
+
   async request(principal: Principal, input: { orderId: string; driverPayoutCents: number }) {
     if (
       input.driverPayoutCents < DELIVERY_MIN_PAYOUT_CENTS ||

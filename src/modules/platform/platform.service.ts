@@ -32,6 +32,28 @@ export const platformService = {
     return flags[feature] === true;
   },
 
+  /**
+   * The OPT-OUT counterpart to `isFeatureExplicitlyEnabled`.
+   *
+   * Deliberately a separate method rather than a negation of that one: `!isFeatureExplicitlyEnabled`
+   * would also be true for an unknown city and a non-live one, quietly closing markets nobody meant
+   * to close. This answers a narrower question — has someone actively turned this feature OFF here?
+   * — so a feature that ships open stays open unless a person decides otherwise.
+   *
+   * Used by delivery, which the product owner opened everywhere. Compliance-gated features must
+   * keep using the explicit-enable check.
+   */
+  async isFeatureExplicitlyDisabled(
+    citySlug: string | null | undefined,
+    feature: string,
+  ): Promise<boolean> {
+    if (!citySlug) return false;
+    const city = await CityModel.findOne({ slug: citySlug }).lean().exec();
+    if (!city) return false;
+    const flags = (city.feature_flags ?? {}) as Record<string, unknown>;
+    return flags[feature] === false;
+  },
+
   async launchStatus() {
     const cities = await CityModel.find({ status: 'live' }).lean().exec();
     return {

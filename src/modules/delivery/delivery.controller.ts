@@ -63,6 +63,11 @@ export const deliveryController = {
   },
 
   // ─── dispatch ───────────────────────────────────────────────────────────────────────────
+  /** What this delivery would pay, from the distance it actually covers. Read-only. */
+  quote: async (req: Request, res: Response): Promise<void> => {
+    ok(res, await deliveryService.quote(principal(req), String(req.params.orderId)));
+  },
+
   request: async (req: Request, res: Response): Promise<void> => {
     created(
       res,

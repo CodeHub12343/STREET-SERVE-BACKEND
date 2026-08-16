@@ -107,6 +107,29 @@ async function userBriefFor(ids: string[]): Promise<Map<string, UserBrief>> {
  * the hub it came from. Read from the checkout rather than passed in, so a caller cannot name
  * themselves into someone else's conversation.
  */
+/**
+ * Who may talk about a delivery: the driver carrying it and the customer waiting for it.
+ *
+ * Only once a driver has ACCEPTED — before that there is no driver, and opening a channel to an
+ * unassigned delivery would mean messaging whoever happens to take it next. The exact address is
+ * already withheld until acceptance for the same reason.
+ *
+ * For coordination, not price. The customer paid at checkout and the driver was offered a fixed
+ * amount computed from the distance; a channel that could change either would turn "where shall I
+ * leave it?" into a negotiation with someone whose food is going cold.
+ */
+async function participantsForDelivery(
+  deliveryId: string,
+): Promise<{ userIds: string[]; title: string } | null> {
+  const { DeliveryRequestModel } = await import('../delivery/delivery.model');
+  const delivery = await DeliveryRequestModel.findById(deliveryId).lean().exec();
+  if (!delivery?.driver_id) return null;
+  return {
+    userIds: [...new Set([delivery.driver_id, delivery.customer_id])],
+    title: 'Delivery',
+  };
+}
+
 async function participantsForCheckout(
   checkoutId: string,
 ): Promise<{ userIds: string[]; title: string } | null> {
@@ -167,13 +190,15 @@ export const messagingService = {
    */
   async openForSubject(
     principal: Principal,
-    subjectType: 'consignment' | 'job',
+    subjectType: 'consignment' | 'job' | 'delivery',
     subjectRefId: string,
   ) {
     const participants =
       subjectType === 'consignment'
         ? await participantsForCheckout(subjectRefId)
-        : await participantsForEngagement(subjectRefId);
+        : subjectType === 'delivery'
+          ? await participantsForDelivery(subjectRefId)
+          : await participantsForEngagement(subjectRefId);
 
     if (!participants) throw NotFoundError('That work no longer exists');
     if (!participants.userIds.includes(principal.userId)) {
@@ -374,7 +399,12 @@ export const messagingService = {
           t,
           side: 'business' as const,
           // Labelled by what the conversation is ABOUT, since there is no business behind it.
-          businessName: t.subject_type === 'consignment' ? 'Consignment' : 'Job',
+          businessName:
+            t.subject_type === 'consignment'
+              ? 'Consignment'
+              : t.subject_type === 'delivery'
+                ? 'Delivery'
+                : 'Job',
           cp: { name: u?.name ?? 'Member', avatarUrl: u?.photoUrl ?? null, userId: otherId },
         };
       }
