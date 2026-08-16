@@ -42,6 +42,14 @@ const EnrollBody = z
   })
   .strict();
 
+/** Suspend or reinstate. A reason is optional but audited — "why" outlives whoever clicked it. */
+const PartnerStatusBody = z
+  .object({
+    status: z.enum(['verified', 'suspended']),
+    reason: z.string().max(280).optional(),
+  })
+  .strict();
+
 const ClaimBody = z.object({ code: z.string().min(4).max(16) }).strict();
 const CustodyBody = z
   .object({ enabled: z.boolean(), collectionNote: z.string().max(300).optional() })
@@ -77,6 +85,39 @@ function principal(req: Request) {
   if (!req.principal) throw UnauthenticatedError();
   return req.principal;
 }
+
+// ─── Admin: the programme roster ────────────────────────────────────────────────────────────
+/**
+ * Who is actually partnered, how many residents each holds, and how much of other people's money is
+ * sitting in their custody. There was no such endpoint, so the admin screen rendered a hardcoded
+ * fixture instead — on the production URL, in both demo and live mode.
+ */
+shelterRouter.get(
+  '/',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('shelter:register_partner'),
+  asyncHandler(async (_req: Request, res: Response) => {
+    ok(res, await shelterService.listPartners());
+  }),
+);
+
+/**
+ * Suspend or reinstate a partner. `suspended` was in the model and reachable by nothing, so a
+ * partner mishandling resident money could not be stopped without editing the database.
+ */
+shelterRouter.patch(
+  '/:id/status',
+  rateLimit('write'),
+  authenticate,
+  requirePermission('shelter:register_partner'),
+  validate({ params: PartnerIdParam, body: PartnerStatusBody }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { id } = params<z.infer<typeof PartnerIdParam>>(req);
+    const input = body<z.infer<typeof PartnerStatusBody>>(req);
+    ok(res, await shelterService.setPartnerStatus(principal(req), id, input.status, input.reason));
+  }),
+);
 
 // ─── Admin: partner registration ────────────────────────────────────────────────────────────
 shelterRouter.post(

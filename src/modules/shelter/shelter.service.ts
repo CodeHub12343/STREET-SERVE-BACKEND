@@ -93,6 +93,118 @@ export const shelterService = {
     return { id: String(partner._id), status: partner.status, ownerUserId: input.ownerUserId };
   },
 
+  /**
+   * ═══ The admin's real view of the programme. ═══
+   *
+   * There was no way to list shelter partners at all, so the admin screen rendered a hardcoded
+   * fixture — two invented organisations with invented enrollment counts — on the production URL,
+   * in both demo and live mode. An operator could not see who was actually partnered, how many
+   * residents each held, or how much of other people's money was sitting in their custody.
+   *
+   * Counts are aggregated per partner rather than per row: this list is opened often and a
+   * per-partner query would be a fan-out on a page whose whole job is one glance.
+   */
+  async listPartners(limit = 100) {
+    const partners = await ShelterPartnerModel.find()
+      .sort({ created_at: -1 })
+      .limit(limit)
+      .lean()
+      .exec();
+    if (partners.length === 0) return [];
+
+    const ids = partners.map((p) => String(p._id));
+    const [enrolled, held] = await Promise.all([
+      ShelterEnrollmentModel.aggregate<{ _id: string; count: number }>([
+        { $match: { shelter_partner_id: { $in: ids }, status: 'active' } },
+        { $group: { _id: '$shelter_partner_id', count: { $sum: 1 } } },
+      ]).exec(),
+      /**
+       * Money the shelter is holding FOR residents and has not handed over. The single most
+       * important number on this screen: it is the size of the fiduciary duty each partner is
+       * currently carrying, and nothing anywhere surfaced it.
+       */
+      ShelterCustodyModel.aggregate<{ _id: string; total: number }>([
+        { $match: { shelter_partner_id: { $in: ids }, status: 'held' } },
+        { $group: { _id: '$shelter_partner_id', total: { $sum: '$amount_cents' } } },
+      ]).exec(),
+    ]);
+    const enrolledBy = new Map(enrolled.map((e) => [e._id, e.count]));
+    const heldBy = new Map(held.map((h) => [h._id, h.total]));
+
+    return partners.map((p) => ({
+      id: String(p._id),
+      organizationName: p.organization_name,
+      status: p.status,
+      ownerUserId: p.owner_user_id,
+      residentsEnrolled: enrolledBy.get(String(p._id)) ?? 0,
+      custodyHeldCents: heldBy.get(String(p._id)) ?? 0,
+      custodyAccepted: p.custody_enabled === true,
+      verifiedAt: p.verified_at ?? null,
+      createdAt: p.created_at ?? null,
+    }));
+  },
+
+  /**
+   * Suspend a partner, or reinstate one.
+   *
+   * `suspended` was declared in the model and reachable by no code path — so if a partner
+   * mishandled resident money there was no button anywhere that did anything about it. The whole
+   * programme rests on organisations holding cash that belongs to people who cannot hold it
+   * themselves; "we would have to edit the database" is not an answer to that going wrong.
+   *
+   * Suspension stops NEW residents and NEW custody: `assertPartnerOwner` and `residentCapabilities`
+   * both already require `verified`, so this needs no new enforcement. Residents already enrolled
+   * are deliberately untouched, and money already held is deliberately still disbursable — cutting
+   * off a resident's access to their own money because their shelter is under review would punish
+   * exactly the wrong person.
+   */
+  async setPartnerStatus(
+    admin: Principal,
+    partnerId: string,
+    status: 'verified' | 'suspended',
+    reason?: string,
+  ) {
+    const partner = await ShelterPartnerModel.findByIdAndUpdate(
+      partnerId,
+      {
+        $set: {
+          status,
+          ...(status === 'verified'
+            ? { verified_by_admin_id: admin.userId, verified_at: new Date() }
+            : {}),
+        },
+      },
+      { new: true },
+    ).exec();
+    if (!partner) throw NotFoundError('Shelter partner not found');
+
+    await writeAudit({
+      actorId: admin.userId,
+      actorRole: 'admin',
+      action: status === 'suspended' ? 'shelter_partner.suspended' : 'shelter_partner.reinstated',
+      entityType: 'shelter_partner',
+      entityId: partnerId,
+      reason: reason ?? null,
+      metadata: { organizationName: partner.organization_name },
+    });
+
+    const heldAgg = await ShelterCustodyModel.aggregate<{ total: number }>([
+      { $match: { shelter_partner_id: partnerId, status: 'held' } },
+      { $group: { _id: null, total: { $sum: '$amount_cents' } } },
+    ]).exec();
+
+    return {
+      id: partnerId,
+      status: partner.status,
+      /**
+       * Reported back so the admin is told immediately if they have just suspended a partner who is
+       * still holding residents' money. That is not a reason to refuse the suspension — it is the
+       * most likely reason to be doing it — but it is the next thing that needs handling.
+       */
+      custodyHeldCents: heldAgg[0]?.total ?? 0,
+    };
+  },
+
   async assertPartnerOwner(principal: Principal, partnerId: string) {
     const partner = await ShelterPartnerModel.findById(partnerId).exec();
     if (!partner) throw NotFoundError('Shelter partner not found');

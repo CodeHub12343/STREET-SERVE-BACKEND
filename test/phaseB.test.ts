@@ -684,6 +684,89 @@ describe('B-3: a resident with no bank account still gets paid', () => {
 });
 
 // ─── Reporting ───────────────────────────────────────────────────────────────────────────────
+/**
+ * ═══ The admin's view of the programme. ═══
+ *
+ * There was no way to list partners at all, so the admin screen rendered a hardcoded fixture — two
+ * invented organisations with invented enrollment counts — on the production URL, in both demo and
+ * live mode. And `suspended` sat in the model reachable by nothing, so a partner mishandling
+ * residents' money could not be stopped without editing the database.
+ */
+describe('admin oversight of shelter partners', () => {
+  it('lists real partners with their enrollment and custody exposure', async () => {
+    const shelter = await makeShelter('b-roster', { custody: true });
+    const adminToken = await makeAdmin('b-roster-admin');
+
+    const res = await request(app)
+      .get('/api/v1/shelter-partners')
+      .set(...bearer(adminToken));
+    expect(res.status).toBe(200);
+
+    const row = (res.body.data as { id: string; organizationName: string }[]).find(
+      (p) => p.id === shelter.partnerId,
+    );
+    expect(row).toBeDefined();
+    expect(row!.organizationName).toContain('Hope Center');
+    // The numbers are derived from real rows, not invented.
+    expect(res.body.data.find((p: { id: string }) => p.id === shelter.partnerId)).toMatchObject({
+      status: 'verified',
+      residentsEnrolled: expect.any(Number),
+      custodyHeldCents: expect.any(Number),
+    });
+  });
+
+  it('suspends a partner, and says how much of residents’ money they still hold', async () => {
+    const shelter = await makeShelter('b-suspend');
+    const adminToken = await makeAdmin('b-suspend-admin');
+
+    const res = await request(app)
+      .patch(`/api/v1/shelter-partners/${shelter.partnerId}/status`)
+      .set(...bearer(adminToken))
+      .send({ status: 'suspended', reason: 'under review' });
+    expect(res.status).toBe(200);
+    expect(res.body.data.status).toBe('suspended');
+    /**
+     * Reported so an admin is told immediately if they have just suspended a partner still holding
+     * residents' cash. Not a reason to refuse the suspension — it is the likeliest reason for it —
+     * but it is the next thing that needs handling.
+     */
+    expect(res.body.data.custodyHeldCents).toEqual(expect.any(Number));
+
+    // A suspended partner takes no NEW residents.
+    const enroll = await request(app)
+      .post(`/api/v1/shelter-partners/${shelter.partnerId}/enrollments`)
+      .set(...bearer(shelter.staffToken))
+      .send({ cosignedAllocationCents: 5_000, staffVerifierName: 'Dana R.' });
+    expect([403, 404]).toContain(enroll.status);
+
+    // …and reinstating puts them straight back to work.
+    await request(app)
+      .patch(`/api/v1/shelter-partners/${shelter.partnerId}/status`)
+      .set(...bearer(adminToken))
+      .send({ status: 'verified' })
+      .expect(200);
+    const again = await request(app)
+      .post(`/api/v1/shelter-partners/${shelter.partnerId}/enrollments`)
+      .set(...bearer(shelter.staffToken))
+      .send({ cosignedAllocationCents: 5_000, staffVerifierName: 'Dana R.' });
+    expect(again.status).toBe(201);
+  });
+
+  it('is admin-only — a shelter’s own staff cannot suspend or roster', async () => {
+    const shelter = await makeShelter('b-rosterauth');
+    for (const call of [
+      request(app).get('/api/v1/shelter-partners').set(...bearer(shelter.staffToken)),
+      request(app)
+        .patch(`/api/v1/shelter-partners/${shelter.partnerId}/status`)
+        .set(...bearer(shelter.staffToken))
+        .send({ status: 'suspended' }),
+    ]) {
+      const res = await call;
+      expect([403, 404]).toContain(res.status);
+    }
+  });
+});
+
 describe('shelter reporting stays aggregate-only', () => {
   it('reports counts and totals, never per-resident rows', async () => {
     const shelter = await makeShelter('breport', { custody: true });
