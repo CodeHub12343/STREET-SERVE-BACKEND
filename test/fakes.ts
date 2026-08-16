@@ -170,6 +170,13 @@ export class FakeStripeGateway implements StripeGateway {
     });
   }
 
+  retrievePaymentMethod(
+    id: string,
+  ): Promise<{ brand: string | null; last4: string | null } | null> {
+    // Stable per id so a test can assert the schedule names the same card twice.
+    return Promise.resolve({ brand: 'visa', last4: id.slice(-4).padStart(4, '4') });
+  }
+
   retrieveSetupIntent(
     id: string,
   ): Promise<{ id: string; status: string; paymentMethodId?: string | null }> {

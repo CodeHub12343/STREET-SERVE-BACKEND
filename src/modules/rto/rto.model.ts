@@ -265,9 +265,11 @@ const RtoAgreementSchema = new Schema(
      */
     pending_intent_kind: {
       type: String,
-      enum: ['acceptance', 'payoff', 'card_setup'],
+      enum: ['acceptance', 'payoff', 'card_setup', 'installment'],
       default: null,
     },
+    /** Which instalment a `pending_intent_kind: 'installment'` charge is for. */
+    pending_intent_installment: { type: Number, default: null },
 
     /**
      * ═══ The card the instalments are collected from. ═══
@@ -287,11 +289,23 @@ const RtoAgreementSchema = new Schema(
      */
     payment_method_ref: { type: String, default: null },
     /**
-     * §49 — the bank asked the customer to authenticate this instalment (SCA/3-D Secure). NOT a
-     * decline, and it must never be treated as one: the customer has done nothing wrong and their
-     * card is fine. Holds the intent they need to confirm, so the app can hand them straight to it.
+     * The card as a human recognises it. Stored so the schedule can say "your card ending 4242"
+     * rather than "your saved card" — a customer agreeing to eleven more automatic payments is
+     * entitled to know which card they will come off, and a `pm_…` id tells them nothing.
      */
-    action_required_intent_ref: { type: String, default: null },
+    payment_method_brand: { type: String, default: null },
+    payment_method_last4: { type: String, default: null },
+    /**
+     * §49 — a scheduled payment is waiting on the CUSTOMER. Either the bank asked them to
+     * authenticate it (SCA/3-D Secure), or there is no saved card to charge. Neither is a decline
+     * and neither is their fault, so this never touches the delinquency machinery.
+     *
+     * The intent itself lives in `pending_intent_ref` with kind `installment`, NOT in a field of its
+     * own. It had one — and `creditByPaymentIntent` only ever looked at `pending_intent_ref`, so an
+     * instalment the customer came back and paid was charged and then never credited: money taken,
+     * no ownership, the instalment still showing as scheduled. Two places holding "the intent we are
+     * waiting on" is how one of them stops being read.
+     */
     action_required_installment: { type: Number, default: null },
 
     /**

@@ -107,6 +107,14 @@ export interface StripeGateway {
     idempotencyKey: string;
   }): Promise<{ setupIntentId: string; clientSecret: string | null; status: string }>;
 
+  /**
+   * The card as a human recognises it. A `pm_…` id is meaningless to the person being asked to
+   * agree to eleven more automatic payments off it.
+   */
+  retrievePaymentMethod(
+    id: string,
+  ): Promise<{ brand: string | null; last4: string | null } | null>;
+
   retrieveSetupIntent(id: string): Promise<{
     id: string;
     status: string;

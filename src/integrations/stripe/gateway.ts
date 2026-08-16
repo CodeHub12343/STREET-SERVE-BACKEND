@@ -158,6 +158,13 @@ export class StripeConnectGateway implements StripeGateway {
     };
   }
 
+  async retrievePaymentMethod(
+    id: string,
+  ): Promise<{ brand: string | null; last4: string | null } | null> {
+    const pm = await this.client.paymentMethods.retrieve(id);
+    return { brand: pm.card?.brand ?? null, last4: pm.card?.last4 ?? null };
+  }
+
   async retrieveSetupIntent(
     id: string,
   ): Promise<{ id: string; status: string; paymentMethodId?: string | null }> {

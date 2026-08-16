@@ -522,7 +522,9 @@ describe('RTO instalments are collected off-session from a saved card', () => {
     const row = await RtoAgreementModel.findById(agreementId).lean();
     expect(row!.status).toBe('active'); // not grace
     expect(row!.action_required_installment).toBe(1);
-    expect(row!.action_required_intent_ref).toEqual(expect.any(String));
+    // The intent lives on the unified pending ref, which is what the webhook actually reads.
+    expect(row!.pending_intent_kind).toBe('installment');
+    expect(row!.pending_intent_ref).toEqual(expect.any(String));
     // The instalment is still owed, not written off as failed.
     const inst = await RtoInstallmentModel.findOne({
       agreement_id: agreementId,
@@ -532,7 +534,7 @@ describe('RTO instalments are collected off-session from a saved card', () => {
 
     // And the customer can finish it — against the SAME intent, so the money is not taken twice.
     const resume = await request(app)
-      .post(`/api/v1/rto/agreements/${agreementId}/resume-payment`)
+      .post(`/api/v1/rto/agreements/${agreementId}/pay-installment`)
       .set(...bearer(token))
       .set('Idempotency-Key', 'rto-sca-resume')
       .send({});
@@ -578,13 +580,112 @@ describe('RTO instalments are collected off-session from a saved card', () => {
 
     // Resuming opens a fresh on-session charge AND saves the card, so the schedule self-heals.
     const resume = await request(app)
-      .post(`/api/v1/rto/agreements/${agreementId}/resume-payment`)
+      .post(`/api/v1/rto/agreements/${agreementId}/pay-installment`)
       .set(...bearer(token))
       .set('Idempotency-Key', 'rto-nocard-resume')
       .send({});
     expect(resume.status).toBe(200);
     expect(resume.body.data.clientSecret).toEqual(expect.any(String));
     expect(fakeStripe.charges.at(-1)!.savePaymentMethod).toBe(true);
+  });
+
+  /**
+   * ═══ Paying an instalment by hand must actually credit it. ═══
+   *
+   * Two things at once. First, the product had no way to pay an instalment early at all: the screen
+   * showed "0/12 payments made · next due 23 Aug" and offered nothing but a full payoff, so a
+   * customer who wanted to clear one could not.
+   *
+   * Second, the intent for a hand-paid instalment used to be stored on a field of its own that
+   * `creditByPaymentIntent` never read — so the SCA and no-card recovery paths took the money and
+   * credited nothing: no ledger entry, no ownership, the instalment still showing as scheduled. It
+   * now rides the same `pending_intent_ref` rail as everything else.
+   */
+  it('lets a customer pay the next instalment early, and credits it', async () => {
+    const seller = await approvedSeller('rto-payearly');
+    const listingId = await publishListing(seller, TERMS, { productName: 'Mixer' });
+    const token = await customer('rto-payearly');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-payearly-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId);
+
+    const before = await request(app)
+      .get(`/api/v1/rto/agreements/${agreementId}`)
+      .set(...bearer(token));
+    expect(before.body.data.installmentsPaid).toBe(0);
+    // The screen can now say WHAT is next and WHICH card it comes off.
+    expect(before.body.data.nextInstallment.installmentNumber).toBe(1);
+    expect(before.body.data.nextInstallment.amountCents).toBeGreaterThan(0);
+    expect(before.body.data.savedCard.last4).toEqual(expect.any(String));
+
+    // Nothing is due yet — this is paying AHEAD, which had no path before.
+    const pay = await request(app)
+      .post(`/api/v1/rto/agreements/${agreementId}/pay-installment`)
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-payearly-pay')
+      .send({});
+    expect(pay.status).toBe(200);
+    expect(pay.body.data.installmentNumber).toBe(1);
+    expect(pay.body.data.clientSecret).toEqual(expect.any(String));
+
+    // Still uncredited until the card clears — same rule as everywhere else.
+    expect((await RtoAgreementModel.findById(agreementId).lean())!.installments_paid ?? 0).toBe(0);
+
+    await settlePendingPayment(agreementId);
+
+    const after = await request(app)
+      .get(`/api/v1/rto/agreements/${agreementId}`)
+      .set(...bearer(token));
+    expect(after.body.data.installmentsPaid).toBe(1);
+    expect(after.body.data.ownershipCreditedCents).toBe(4000); // 2000 initial + 2000 instalment
+    expect(
+      await RtoLedgerEntryModel.countDocuments({
+        agreement_id: agreementId,
+        entry_type: 'installment',
+      }),
+    ).toBe(1);
+    expect(
+      (await RtoInstallmentModel.findOne({ agreement_id: agreementId, installment_number: 1 }).lean())!
+        .status,
+    ).toBe('paid');
+
+    // The schedule has moved on rather than re-offering the one just paid.
+    expect(after.body.data.nextInstallment.installmentNumber).toBe(2);
+  });
+
+  /** Asking twice must hand back the SAME intent, never open a second charge for one instalment. */
+  it('does not open a second charge when a payment is already in flight', async () => {
+    const seller = await approvedSeller('rto-twice');
+    const listingId = await publishListing(seller, TERMS, { productName: 'Lamp' });
+    const token = await customer('rto-twice');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-twice-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId);
+
+    const first = await request(app)
+      .post(`/api/v1/rto/agreements/${agreementId}/pay-installment`)
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-twice-a')
+      .send({});
+    const second = await request(app)
+      .post(`/api/v1/rto/agreements/${agreementId}/pay-installment`)
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-twice-b')
+      .send({});
+
+    expect(second.status).toBe(200);
+    expect(second.body.data.installmentNumber).toBe(first.body.data.installmentNumber);
+    // One intent on the agreement, not two charges racing for one instalment.
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.pending_intent_installment).toBe(1);
   });
 
   /** A genuine decline still drives the R22 state machine exactly as before. */

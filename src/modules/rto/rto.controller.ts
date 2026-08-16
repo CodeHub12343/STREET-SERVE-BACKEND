@@ -64,10 +64,13 @@ export const rtoController = {
     const { id } = params<z.infer<typeof AgreementIdParam>>(req);
     ok(res, await rtoService.getDashboard(principal(req), id));
   },
-  /** Pay an instalment the sweep could not collect (SCA challenge, or no card on file). */
-  resumePayment: async (req: Request, res: Response): Promise<void> => {
+  /**
+   * Pay an instalment with the customer present — one the sweep could not collect (SCA challenge,
+   * no card on file), or simply the next one, paid ahead of its due date.
+   */
+  payInstallment: async (req: Request, res: Response): Promise<void> => {
     const { id } = params<z.infer<typeof AgreementIdParam>>(req);
-    ok(res, await rtoService.resumeInstallment(principal(req), id, idemKey(req)));
+    ok(res, await rtoService.payInstallment(principal(req), id, idemKey(req)));
   },
 
   payoff: async (req: Request, res: Response): Promise<void> => {

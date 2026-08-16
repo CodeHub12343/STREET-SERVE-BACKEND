@@ -193,19 +193,19 @@ rtoRouter.post(
 );
 
 /**
- * Finish an instalment the automatic charge could not take on its own — either because the bank
- * asked the customer to authenticate (SCA), or because there is no saved card to charge. Money +
- * idempotent, like every other charge path: a double tap here would be a double instalment.
+ * Pay an instalment with the customer present: one the automatic charge could not take (an SCA
+ * challenge, or no saved card), or simply the next one paid early. Money + idempotent, like every
+ * other charge path — a double tap here would be a double instalment.
  */
 rtoRouter.post(
-  '/agreements/:id/resume-payment',
+  '/agreements/:id/pay-installment',
   rateLimit('money'),
   requireFeature('rto'),
   authenticate,
   requirePermission('rto:read_own'),
   idempotency,
   validate({ params: AgreementIdParam }),
-  asyncHandler(rtoController.resumePayment),
+  asyncHandler(rtoController.payInstallment),
 );
 
 /**
