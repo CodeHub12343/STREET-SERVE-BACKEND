@@ -4,10 +4,12 @@ import {
   PAY_FORWARD_EXPIRY_NOTICE_DAYS,
   PAY_FORWARD_MAX_CONTRIBUTION_CENTS,
   PAY_FORWARD_MIN_CONTRIBUTION_CENTS,
+  PAY_FORWARD_RECONCILE_AFTER_MS,
   PAY_FORWARD_REDEEM_MIN_TIER,
   TIER_RANK,
 } from '../../config/constants';
 import { logger } from '../../config/logger';
+import { stripe } from '../../integrations/stripe';
 import { writeAudit } from '../../shared/audit';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import {
@@ -298,7 +300,97 @@ export const payforwardService = {
       { stripe_payment_intent_id: paymentIntentId, status: 'pending' },
       { $set: { status: 'failed', failure_reason: reason } },
     ).exec();
-    return { handled: Boolean(res) };
+    if (!res) return { handled: false };
+
+    /**
+     * Tell the giver. Recording the failure in the database was only half the job: a person who
+     * meant to help someone and whose card was declined heard nothing at all, and had no way to
+     * discover it — a contribution is the one payment in this platform that sends back no receipt,
+     * no order, and no goods, so silence is indistinguishable from success.
+     *
+     * Deliberately does not restate the decline reason from Stripe: the giver needs to know it did
+     * not go through and that they can try again, not the processor's error taxonomy.
+     */
+    notificationsService.notify(res.contributor_id, {
+      category: 'generosity',
+      title: 'Your gift didn’t go through',
+      body: `Your ${formatCents(res.amount_cents)} Pay It Forward gift couldn’t be taken from your card, so nothing was charged. You can try again whenever you like.`,
+      data: { businessId: res.business_id, contributionId: String(res._id) },
+    });
+    return { handled: true };
+  },
+
+  /**
+   * ═══ Rescue contributions whose webhook never arrived. ═══
+   *
+   * A webhook is a delivery PROMISE, not a guarantee: the endpoint 500s, the forwarder is down,
+   * Stripe's retries lapse. When one is missed here the money HAS been taken and the pool is never
+   * credited — the giver is charged, no one is ever helped by it, and nothing in the system knows.
+   * Of all the places to lose a webhook this is the worst, because there is no order to chase and
+   * no goods to be missing: the contribution simply sits `pending` and no party has a reason to
+   * look.
+   *
+   * The ads module carries this same rescue for exactly this reason, after two real placements were
+   * charged and stayed pending. This is the same pattern: **Stripe is authoritative**, we ask it
+   * what actually happened rather than trusting our own row, and we only ever move a contribution
+   * forward when Stripe says the money is there. Idempotent by construction — it reuses
+   * `creditContribution`/`failContribution`, which no-op on anything not still pending.
+   */
+  async reconcilePendingContributions(limit = SWEEP_BATCH_LIMIT): Promise<{
+    checked: number;
+    credited: number;
+    failed: number;
+  }> {
+    /**
+     * A grace period, so this never races the webhook it is backstopping. An intent created seconds
+     * ago is not late, it is in flight — and crediting it here would only duplicate work the
+     * webhook is about to do (harmlessly, but noisily).
+     */
+    const cutoff = new Date(Date.now() - PAY_FORWARD_RECONCILE_AFTER_MS);
+    const pending = await CommunityContributionModel.find({
+      status: 'pending',
+      stripe_payment_intent_id: { $ne: null },
+      created_at: { $lte: cutoff },
+    })
+      .sort({ created_at: 1 })
+      .limit(limit)
+      .lean()
+      .exec();
+
+    let credited = 0;
+    let failed = 0;
+    for (const c of pending) {
+      const pi = String(c.stripe_payment_intent_id);
+      try {
+        const intent = await stripe().retrievePaymentIntent(pi);
+        if (intent.status === 'succeeded') {
+          const res = await this.creditContribution(pi);
+          if (res.handled) {
+            credited += 1;
+            logger.warn(
+              { contributionId: String(c._id), paymentIntentId: pi },
+              'credited a paid Pay It Forward contribution whose webhook never arrived — check webhook delivery',
+            );
+          }
+        } else if (intent.status === 'canceled') {
+          /**
+           * A dead intent must not linger as pending for ever. Left alone it is indistinguishable
+           * from one still in flight, both to the giver and to this sweep on every future run.
+           */
+          await this.failContribution(pi, 'payment_canceled');
+          failed += 1;
+        }
+      } catch (err) {
+        // One unreadable intent must not stop the others from being rescued.
+        logger.error(
+          { err, contributionId: String(c._id) },
+          'could not reconcile a Pay It Forward contribution',
+        );
+      }
+    }
+
+    reportSweepBatch('payforward-reconcile', pending.length);
+    return { checked: pending.length, credited, failed };
   },
 
   // ─── Redemption (money out) ───────────────────────────────────────────────────────────────
@@ -504,6 +596,112 @@ export const payforwardService = {
   },
 
   /**
+   * ═══ The order was cancelled. Give the community its money back. ═══
+   *
+   * `cancel` refunded the customer's card and stopped there, so the community's share of a
+   * cancelled order simply evaporated: the pool had been debited, the FIFO contributions consumed,
+   * the ledger posted — and then the meal never happened. Nobody was fed and the money was gone.
+   * On a fully-covered order the customer's refund is £0, so there was no trace of the loss on any
+   * screen at all.
+   *
+   * Returned to the POOL, not to the giver. The gift was made to the fund rather than to a
+   * particular order, so the right destination is the fund, ready for the next person — refunding
+   * the original card would undo a gift its giver never withdrew.
+   *
+   * The day-slot is deliberately NOT freed. The redemption is reversed for accounting, but the
+   * `{business, user, day}` row stays `refunded` so it still occupies the unique index: releasing
+   * it would let someone order, cancel, and re-draw the fund repeatedly within a day, which is the
+   * cheapest possible way to drain a pool. A person genuinely affected by this waits until
+   * tomorrow, which is the same rule everyone else is under.
+   */
+  async refundRedemptionForOrder(orderId: string): Promise<number> {
+    const redemption = await CommunityRedemptionModel.findOneAndUpdate(
+      { order_id: orderId, status: 'applied' },
+      { $set: { status: 'refunded', refunded_at: new Date() } },
+      { new: true },
+    ).exec();
+    if (!redemption) return 0; // no community money in this order, or already reversed
+
+    const amount = redemption.amount_cents;
+    await CommunityFundModel.updateOne(
+      { business_id: redemption.business_id },
+      { $inc: { balance_cents: amount } },
+    ).exec();
+
+    /**
+     * Put the money back on the contributions it came off, newest-consumed first, so FIFO ordering
+     * survives the round trip: a reversal that restored the OLDEST contributions would quietly
+     * reset the expiry clock on money that was about to lapse.
+     */
+    await this.restoreFifo(redemption.business_id, amount);
+
+    /**
+     * The INVERSE of the redeem posting, not a contributor refund: nothing leaves the platform, the
+     * community is simply owed its money again. The fee reversed is the one actually taken at
+     * redeem time, read off the row rather than recomputed — a fee-rule change between the order
+     * and its cancellation must not alter what is given back.
+     */
+    await communityFundLedger.reverseRedemption({
+      fund: { businessId: redemption.business_id },
+      amountCents: amount,
+      feeCents: redemption.fee_cents ?? 0,
+      redemptionId: String(redemption._id),
+      memo: `Order ${orderId} cancelled — returned to the fund`,
+    });
+
+    await invalidateAggregate(`pf:impact:${redemption.business_id}`);
+    await writeAudit({
+      action: 'payforward.redemption_refunded',
+      entityType: 'community_fund',
+      entityId: redemption.business_id,
+      metadata: { orderId, amountCents: amount, redemptionId: String(redemption._id) },
+    });
+    return amount;
+  },
+
+  /**
+   * The inverse of `consumeFifo`: give the money back to the most-recently-drawn contributions
+   * first, so the oldest money stays spent-first and its expiry clock is not rewound.
+   */
+  async restoreFifo(businessId: string, amountCents: number): Promise<void> {
+    let left = amountCents;
+    const consumed = await CommunityContributionModel.find({
+      business_id: businessId,
+      status: 'succeeded',
+      expired_at: null,
+      $expr: { $lt: ['$remaining_cents', '$amount_cents'] },
+    })
+      .sort({ created_at: -1 })
+      .exec();
+
+    for (const c of consumed) {
+      if (left <= 0) break;
+      const room = c.amount_cents - c.remaining_cents;
+      const give = Math.min(left, room);
+      if (give <= 0) continue;
+      const ok = await CommunityContributionModel.updateOne(
+        // Guarded so a concurrent redemption cannot push `remaining` above what was given.
+        { _id: c._id, remaining_cents: { $lte: c.amount_cents - give } },
+        { $inc: { remaining_cents: give } },
+      ).exec();
+      if (ok.modifiedCount > 0) left -= give;
+    }
+
+    if (left > 0) {
+      /**
+       * The pool balance is correct (it was incremented directly) but the contribution rows could
+       * not absorb the reversal — every contribution it came from has since expired. Visible rather
+       * than absorbed: this is drift between the pool and its backing rows, and the FIFO sweep is
+       * the only thing that can explain it later.
+       */
+      logger.error(
+        { businessId, amountCents, shortfallCents: left },
+        'payforward FIFO could not fully restore a refunded redemption',
+      );
+    }
+  },
+
+  /**
    * Draw down the oldest live contributions first. FIFO is what makes expiry meaningful: without it
    * the sweep could not say which dollars had been sitting unused, and the newest gift would age at
    * the same rate as the oldest.
@@ -599,6 +797,52 @@ export const payforwardService = {
       /** Distinct accounts helped. Never a list — who accepted help is not the vendor's to publish. */
       peopleHelped: got?.people?.length ?? 0,
     };
+  },
+
+  /**
+   * ═══ A giver's own gifts, with their real status. ═══
+   *
+   * The one payment in this platform that returns nothing: no order, no goods, no receipt screen.
+   * There was no way to answer "did my gift actually go through?" — the public wall shows only
+   * `succeeded` contributions and shows them anonymously, so a giver could not even find their own,
+   * and a card that failed left no trace they could see.
+   *
+   * Deliberately shows `pending` and `failed` too. This is the one view where a contribution that
+   * did not land is the most important row on the screen.
+   */
+  async myContributions(userId: string, limit = 20) {
+    const rows = await CommunityContributionModel.find({ contributor_id: userId })
+      .sort({ created_at: -1 })
+      .limit(Math.min(limit, 50))
+      .lean()
+      .exec();
+
+    const businessIds = [...new Set(rows.map((r) => r.business_id))];
+    const { BusinessModel } = await import('../vendors/vendors.model');
+    const businesses = await BusinessModel.find({ _id: { $in: businessIds } })
+      .select('name')
+      .lean()
+      .exec();
+    const nameById = new Map(businesses.map((b) => [String(b._id), b.name]));
+
+    return rows.map((r) => ({
+      id: String(r._id),
+      businessId: r.business_id,
+      businessName: nameById.get(r.business_id) ?? null,
+      amountCents: r.amount_cents,
+      status: r.status,
+      /**
+       * How much of THIS gift is still waiting for someone. The giver gave it; they are entitled to
+       * know whether it has done anything yet, and it is the only honest way to show impact per
+       * gift without ever naming who was helped.
+       */
+      remainingCents: r.status === 'succeeded' ? r.remaining_cents : 0,
+      note: r.note ?? null,
+      anonymous: r.anonymous !== false,
+      createdAt: r.created_at,
+      expiresAt: r.expires_at ?? null,
+      expiredAt: r.expired_at ?? null,
+    }));
   },
 
   /** Recent gifts for the business's wall, anonymity applied at serialisation. */

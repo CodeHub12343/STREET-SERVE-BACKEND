@@ -19,6 +19,21 @@ import { BusinessIdParam, ContributeBody, FundSettingsBody } from './payforward.
  */
 export const payforwardRouter = Router();
 
+/**
+ * The caller's own gifts. **Declared before `/:businessId`**, which would otherwise match `mine` as
+ * a business id and hand back a fund for a business that does not exist.
+ *
+ * Authenticated and self-scoped — it is the only view in this module that shows a contribution
+ * which did not settle, and the only one that could ever tie a gift to the person who gave it.
+ */
+payforwardRouter.get(
+  '/contributions/mine',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('payforward:contribute'),
+  asyncHandler(payforwardController.mine),
+);
+
 payforwardRouter.get(
   '/:businessId',
   rateLimit('read'),

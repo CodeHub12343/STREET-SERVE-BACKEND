@@ -47,4 +47,9 @@ export const payforwardController = {
     const { businessId } = params<z.infer<typeof BusinessIdParam>>(req);
     ok(res, await payforwardService.recentContributions(businessId));
   },
+
+  /** The caller's own gifts, including the ones that are still pending or that failed. */
+  mine: async (req: Request, res: Response): Promise<void> => {
+    ok(res, await payforwardService.myContributions(principal(req).userId));
+  },
 };

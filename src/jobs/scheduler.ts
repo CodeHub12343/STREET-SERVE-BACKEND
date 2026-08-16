@@ -184,6 +184,17 @@ export async function registerScheduledJobs(connection: Redis): Promise<void> {
     { repeat: { every: 86_400_000 }, jobId: 'payforward-expiry-notice', removeOnComplete: true },
   );
   await sweeps.add(
+    'payforward-reconcile',
+    {},
+    /**
+     * Every 15 minutes, unlike the daily expiry sweeps above, because this one is about money that
+     * has ALREADY been taken. A missed webhook here means the giver was charged and the pool was
+     * never credited — with no order to chase and no goods to be missing, nobody has any reason to
+     * notice. A day of that is a day of gifts that helped no one.
+     */
+    { repeat: { every: 900_000 }, jobId: 'payforward-reconcile', removeOnComplete: true },
+  );
+  await sweeps.add(
     'booking-reminders',
     {},
     { repeat: { every: 300_000 }, jobId: 'booking-reminders', removeOnComplete: true },

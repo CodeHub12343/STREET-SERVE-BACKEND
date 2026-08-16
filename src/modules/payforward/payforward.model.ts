@@ -135,9 +135,21 @@ const CommunityRedemptionSchema = new Schema(
     fee_cents: { type: Number, default: 0 },
     /** UTC YYYY-MM-DD. Carries the one-per-day rule into an index rather than a race-prone read. */
     day_key: { type: String, required: true },
-    status: { type: String, enum: ['reserved', 'applied', 'released'], default: 'reserved' },
+    /**
+     * `refunded` is distinct from `released`, and the difference is load-bearing for the daily
+     * limit. A `released` redemption never happened (the card failed before the order existed), so
+     * it must not consume the person's one slot. A `refunded` one DID happen and was then unwound —
+     * it stays inside the unique index's partial filter, because freeing the slot would let someone
+     * order, cancel, and re-draw the pool repeatedly within a day.
+     */
+    status: {
+      type: String,
+      enum: ['reserved', 'applied', 'released', 'refunded'],
+      default: 'reserved',
+    },
     released_reason: { type: String, default: null },
     applied_at: { type: Date, default: null },
+    refunded_at: { type: Date, default: null },
   },
   {
     timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' },
@@ -153,7 +165,9 @@ const CommunityRedemptionSchema = new Schema(
  */
 CommunityRedemptionSchema.index(
   { business_id: 1, user_id: 1, day_key: 1 },
-  { unique: true, partialFilterExpression: { status: { $in: ['reserved', 'applied'] } } },
+  // `refunded` is included deliberately — see the status comment above. A cancelled order does not
+  // hand the person a fresh draw on the pool.
+  { unique: true, partialFilterExpression: { status: { $in: ['reserved', 'applied', 'refunded'] } } },
 );
 /** The daily-budget check, and the impact dashboard's date ranges. */
 CommunityRedemptionSchema.index({ business_id: 1, day_key: 1, status: 1 });

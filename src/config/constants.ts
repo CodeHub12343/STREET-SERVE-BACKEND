@@ -128,6 +128,13 @@ export const PAY_FORWARD_EXPIRY_DAY_OPTIONS = [30, 60, 365] as const;
 export const PAY_FORWARD_DEFAULT_EXPIRY_DAYS = 365;
 /** Notice to the vendor this many days before money in their pool goes stale, so it can be used. */
 export const PAY_FORWARD_EXPIRY_NOTICE_DAYS = 30;
+/**
+ * How long a contribution may sit `pending` before the reconcile sweep asks Stripe what actually
+ * happened to it. A grace period rather than zero, so the sweep never races the webhook it exists
+ * to back up: an intent opened seconds ago is in flight, not late. Fifteen minutes is far inside
+ * Stripe's retry window, so a genuinely-delivered webhook always wins.
+ */
+export const PAY_FORWARD_RECONCILE_AFTER_MS = 15 * 60_000;
 /** Floor on a contribution. Below this the processing fee is most of the gift. */
 export const PAY_FORWARD_MIN_CONTRIBUTION_CENTS = 100;
 /**

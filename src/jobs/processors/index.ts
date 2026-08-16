@@ -231,6 +231,13 @@ export function startWorkers(redis: Redis): Worker[] {
           if (n) logger.info({ expired: n }, 'payforward-expiry sweep');
           break;
         }
+        case 'payforward-reconcile': {
+          const r = await payforwardService.reconcilePendingContributions();
+          if (r.credited || r.failed) {
+            logger.info({ ...r }, 'payforward-reconcile sweep');
+          }
+          break;
+        }
         case 'payforward-expiry-notice': {
           const n = await payforwardService.sendExpiryNotices();
           if (n) logger.info({ notified: n }, 'payforward-expiry-notice sweep');
