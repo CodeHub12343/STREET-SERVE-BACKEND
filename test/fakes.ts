@@ -86,15 +86,97 @@ export class FakeStripeGateway implements StripeGateway {
     return Promise.resolve();
   }
 
-  createDestinationCharge(
-    input: DestinationChargeInput,
-  ): Promise<{ paymentIntentId: string; clientSecret: string | null; status: string }> {
+  /**
+   * Cards the fake has "saved", and how an off-session charge against each should behave. Lets a
+   * test model the three real outcomes of a scheduled instalment — collected, bank wants the
+   * customer to authenticate, declined — which is the whole difficulty of recurring payments and
+   * was previously unrepresentable here.
+   */
+  private offSessionOutcome = new Map<string, 'succeeded' | 'requires_action' | 'declined'>();
+
+  /** Make the next off-session charge against this card behave a particular way. */
+  setOffSessionOutcome(
+    paymentMethodId: string,
+    outcome: 'succeeded' | 'requires_action' | 'declined',
+  ): void {
+    this.offSessionOutcome.set(paymentMethodId, outcome);
+  }
+
+  createDestinationCharge(input: DestinationChargeInput): Promise<{
+    paymentIntentId: string;
+    clientSecret: string | null;
+    status: string;
+    paymentMethodId?: string | null;
+  }> {
     this.charges.push(input);
     const paymentIntentId = this.id('pi');
+
+    /**
+     * An off-session charge CONFIRMS immediately, so its status is terminal — unlike the
+     * on-session case below, where nothing has happened until a human enters a card.
+     */
+    if (input.offSession && input.paymentMethodId) {
+      const outcome = this.offSessionOutcome.get(input.paymentMethodId) ?? 'succeeded';
+      if (outcome === 'declined') {
+        return Promise.reject(new Error('card_declined'));
+      }
+      this.intentStatus.set(paymentIntentId, outcome);
+      return Promise.resolve({
+        paymentIntentId,
+        clientSecret: `cs_${paymentIntentId}`,
+        status: outcome,
+        paymentMethodId: input.paymentMethodId,
+      });
+    }
+
+    /**
+     * On-session. `savePaymentMethod` mirrors Stripe's `setup_future_usage`: the card does not
+     * exist yet — it appears when the customer confirms — so it is recorded against the intent and
+     * only surfaces through `retrievePaymentIntent`, exactly as the real flow does.
+     */
+    if (input.savePaymentMethod) {
+      this.savedPaymentMethod.set(paymentIntentId, this.id('pm'));
+    }
     return Promise.resolve({
       paymentIntentId,
       clientSecret: `cs_${paymentIntentId}`,
       status: 'requires_payment_method',
+      paymentMethodId: null,
+    });
+  }
+
+  private savedPaymentMethod = new Map<string, string>();
+
+  ensureCustomer(customerRef: string): Promise<{ customerId: string }> {
+    return Promise.resolve({ customerId: `cus_${customerRef}` });
+  }
+
+  /** Cards collected without a charge — the no-deposit agreement case. */
+  private setupIntents = new Map<string, string>();
+
+  createSetupIntent(input: {
+    customerRef: string;
+    metadata: Record<string, string>;
+    idempotencyKey: string;
+  }): Promise<{ setupIntentId: string; clientSecret: string | null; status: string }> {
+    const setupIntentId = this.id('seti');
+    // A card materialises when the customer confirms; the fake mints it up front and only reveals
+    // it through `retrieveSetupIntent`, which is when the real flow can first see one.
+    this.setupIntents.set(setupIntentId, this.id('pm'));
+    return Promise.resolve({
+      setupIntentId,
+      clientSecret: `cs_${setupIntentId}`,
+      status: 'requires_payment_method',
+    });
+  }
+
+  retrieveSetupIntent(
+    id: string,
+  ): Promise<{ id: string; status: string; paymentMethodId?: string | null }> {
+    return Promise.resolve({
+      id,
+      status: 'succeeded',
+      paymentMethodId: this.setupIntents.get(id) ?? null,
     });
   }
 
@@ -121,9 +203,42 @@ export class FakeStripeGateway implements StripeGateway {
     });
   }
 
-  retrievePaymentIntent(id: string): Promise<{ id: string; status: string; amountCents: number }> {
+  /**
+   * Per-intent status overrides for the reconcile paths.
+   *
+   * `retrievePaymentIntent` used to answer `succeeded` unconditionally, which made every
+   * reconcile-sweep test vacuous: a sweep that only ever sees settled money cannot demonstrate that
+   * it leaves unsettled money alone, and "Stripe is authoritative" is untestable when the fake
+   * Stripe has only one opinion. Default stays `succeeded` so existing callers are unchanged.
+   */
+  private intentStatus = new Map<string, string>();
+
+  /** Mark an intent as settled at Stripe WITHOUT delivering a webhook — the missed-webhook case. */
+  settleIntent(id: string): void {
+    this.intentStatus.set(id, 'succeeded');
+  }
+
+  /** Anything Stripe can report: `requires_payment_method`, `canceled`, `processing`… */
+  setIntentStatus(id: string, status: string): void {
+    this.intentStatus.set(id, status);
+  }
+
+  retrievePaymentIntent(id: string): Promise<{
+    id: string;
+    status: string;
+    amountCents: number;
+    paymentMethodId?: string | null;
+    clientSecret?: string | null;
+  }> {
     const charge = this.platformCharges.find((c) => c.paymentIntentId === id);
-    return Promise.resolve({ id, status: 'succeeded', amountCents: charge?.amountCents ?? 0 });
+    return Promise.resolve({
+      id,
+      status: this.intentStatus.get(id) ?? 'succeeded',
+      amountCents: charge?.amountCents ?? 0,
+      // Only present when the charge asked to keep the card — the same condition as real Stripe.
+      paymentMethodId: this.savedPaymentMethod.get(id) ?? null,
+      clientSecret: `cs_${id}`,
+    });
   }
 
   createRefund(input: {

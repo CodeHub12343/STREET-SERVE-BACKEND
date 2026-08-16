@@ -139,7 +139,14 @@ async function settlePendingPayment(agreementId: string): Promise<boolean> {
   const row = await RtoAgreementModel.findById(agreementId).lean();
   const ref = row?.pending_intent_ref;
   if (!ref) return false;
-  const res = await stripeEvent('payment_intent.succeeded', { id: ref });
+  /**
+   * An agreement with nothing due on day one collects a CARD rather than a payment, so the event
+   * that settles it is `setup_intent.succeeded`. Both paths end with a card on file, which is what
+   * the schedule needs — the difference is only whether money moved today.
+   */
+  const type =
+    row?.pending_intent_kind === 'card_setup' ? 'setup_intent.succeeded' : 'payment_intent.succeeded';
+  const res = await stripeEvent(type, { id: ref });
   expect(res.status).toBe(200);
   return true;
 }
@@ -357,6 +364,178 @@ describe('RTO disclosure + acceptance (R20/R21/R26)', () => {
     expect(
       await RtoLedgerEntryModel.countDocuments({ agreement_id: agreementId, entry_type: 'initial' }),
     ).toBe(1);
+  });
+});
+
+/**
+ * ═══ THE RECURRING RAIL. ═══
+ *
+ * A Rent-to-Own agreement is twelve scheduled payments, and every one falls due when nobody is
+ * looking at a screen. `chargeDueInstallments` opened an ordinary ON-SESSION PaymentIntent for each
+ * — an intent that waits for a human to type a card — and then marked it complete. So even with
+ * acceptance and payoff fixed, the schedule the seller set could never collect a penny: the state
+ * machine, the grace period, the late fees and the disclosure were all sitting on a rail with no
+ * way to take money.
+ *
+ * The fix is stored credentials: keep the card at acceptance (the one moment the customer is
+ * present), then charge off-session. These tests pin the three outcomes that rail actually has.
+ */
+describe('RTO instalments are collected off-session from a saved card', () => {
+  it('saves the card at acceptance and charges the schedule against it', async () => {
+    const seller = await approvedSeller('rto-offsession');
+    const listingId = await publishListing(seller, TERMS, { productName: 'Fridge' });
+    const token = await customer('rto-offsession');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-offsession-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+
+    // Before the card is confirmed there is nothing to charge against.
+    expect((await RtoAgreementModel.findById(agreementId).lean())!.payment_method_ref).toBeNull();
+
+    await settlePendingPayment(agreementId);
+
+    // The card the customer entered is now on file, purely so the schedule can run itself.
+    const saved = (await RtoAgreementModel.findById(agreementId).lean())!.payment_method_ref;
+    expect(saved).toEqual(expect.any(String));
+
+    await RtoInstallmentModel.updateOne(
+      { agreement_id: agreementId, installment_number: 1 },
+      { $set: { due_at: new Date(Date.now() - 60_000) } },
+    );
+    await rtoService.chargeDueInstallments();
+
+    // Charged with nobody present, against the saved card — the thing that could not happen before.
+    const offSession = fakeStripe.charges.filter((c) => c.offSession);
+    expect(offSession.length).toBeGreaterThanOrEqual(1);
+    expect(offSession.at(-1)!.paymentMethodId).toBe(saved);
+
+    const inst = await RtoInstallmentModel.findOne({
+      agreement_id: agreementId,
+      installment_number: 1,
+    }).lean();
+    expect(inst!.status).toBe('paid');
+  });
+
+  /**
+   * An SCA challenge is the bank asking the customer to approve a payment. Their card is fine and
+   * they have done nothing wrong — so it must never touch the delinquency machinery. Treating it as
+   * a decline would push someone into Grace, then Late, then toward recovery of the goods, for
+   * their bank's security policy.
+   */
+  it('treats an authentication request as needing the customer, never as a missed payment', async () => {
+    const seller = await approvedSeller('rto-sca');
+    const listingId = await publishListing(seller, TERMS, { productName: 'Oven' });
+    const token = await customer('rto-sca');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-sca-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId);
+
+    const saved = (await RtoAgreementModel.findById(agreementId).lean())!.payment_method_ref!;
+    fakeStripe.setOffSessionOutcome(saved, 'requires_action');
+
+    await RtoInstallmentModel.updateOne(
+      { agreement_id: agreementId, installment_number: 1 },
+      { $set: { due_at: new Date(Date.now() - 60_000) } },
+    );
+    await rtoService.chargeDueInstallments();
+
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.status).toBe('active'); // not grace
+    expect(row!.action_required_installment).toBe(1);
+    expect(row!.action_required_intent_ref).toEqual(expect.any(String));
+    // The instalment is still owed, not written off as failed.
+    const inst = await RtoInstallmentModel.findOne({
+      agreement_id: agreementId,
+      installment_number: 1,
+    }).lean();
+    expect(inst!.status).toBe('scheduled');
+
+    // And the customer can finish it — against the SAME intent, so the money is not taken twice.
+    const resume = await request(app)
+      .post(`/api/v1/rto/agreements/${agreementId}/resume-payment`)
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-sca-resume')
+      .send({});
+    expect(resume.status).toBe(200);
+    expect(resume.body.data.clientSecret).toEqual(expect.any(String));
+    expect(resume.body.data.installmentNumber).toBe(1);
+  });
+
+  /**
+   * No card on file — an agreement accepted before stored credentials existed, or one whose
+   * acceptance settled without a reusable card. That is OUR failure, so the customer must not be
+   * marked late, charged a fee, or moved a step closer to losing the goods for it.
+   */
+  it('asks for a card rather than marking the customer late when none is saved', async () => {
+    const seller = await approvedSeller('rto-nocard');
+    const listingId = await publishListing(seller, TERMS, { productName: 'Desk' });
+    const token = await customer('rto-nocard');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-nocard-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId);
+
+    // The card goes away (a pre-existing agreement, or a capture that failed).
+    await RtoAgreementModel.updateOne(
+      { _id: agreementId },
+      { $set: { payment_method_ref: null } },
+    );
+    await RtoInstallmentModel.updateOne(
+      { agreement_id: agreementId, installment_number: 1 },
+      { $set: { due_at: new Date(Date.now() - 60_000) } },
+    );
+
+    await rtoService.chargeDueInstallments();
+
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.status).toBe('active');
+    expect(row!.action_required_installment).toBe(1);
+    // No late fee for a card WE failed to keep.
+    expect(row!.late_fees_assessed_cents ?? 0).toBe(0);
+
+    // Resuming opens a fresh on-session charge AND saves the card, so the schedule self-heals.
+    const resume = await request(app)
+      .post(`/api/v1/rto/agreements/${agreementId}/resume-payment`)
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-nocard-resume')
+      .send({});
+    expect(resume.status).toBe(200);
+    expect(resume.body.data.clientSecret).toEqual(expect.any(String));
+    expect(fakeStripe.charges.at(-1)!.savePaymentMethod).toBe(true);
+  });
+
+  /** A genuine decline still drives the R22 state machine exactly as before. */
+  it('still drives Missed → Grace when the saved card is actually declined', async () => {
+    const seller = await approvedSeller('rto-decline');
+    const listingId = await publishListing(seller, TERMS, { productName: 'Chair' });
+    const token = await customer('rto-decline');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-decline-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+    await settlePendingPayment(agreementId);
+
+    const saved = (await RtoAgreementModel.findById(agreementId).lean())!.payment_method_ref!;
+    fakeStripe.setOffSessionOutcome(saved, 'declined');
+
+    await RtoInstallmentModel.updateOne(
+      { agreement_id: agreementId, installment_number: 1 },
+      { $set: { due_at: new Date(Date.now() - 60_000) } },
+    );
+    await rtoService.chargeDueInstallments();
+    expect((await RtoAgreementModel.findById(agreementId).lean())!.status).toBe('grace');
   });
 });
 

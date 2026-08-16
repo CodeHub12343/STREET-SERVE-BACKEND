@@ -257,7 +257,42 @@ const RtoAgreementSchema = new Schema(
      * no-op: the second delivery finds no pending intent and does nothing.
      */
     pending_intent_ref: { type: String, default: null, index: true },
-    pending_intent_kind: { type: String, enum: ['acceptance', 'payoff'], default: null },
+    /**
+     * `card_setup` is an acceptance with nothing to pay today — no deposit, no set-up fee. There is
+     * no charge to hang `setup_future_usage` on, so a SetupIntent collects the card instead. Without
+     * it such an agreement would have no card at all and every one of its instalments would be
+     * uncollectable, which is the exact hole the consignment fixtures fall through.
+     */
+    pending_intent_kind: {
+      type: String,
+      enum: ['acceptance', 'payoff', 'card_setup'],
+      default: null,
+    },
+
+    /**
+     * ═══ The card the instalments are collected from. ═══
+     *
+     * A Rent-to-Own agreement is twelve scheduled payments. `chargeDueInstallments` opened an
+     * ordinary on-session PaymentIntent for each one — an intent that waits for somebody to type a
+     * card — so an instalment falling due at 3am on a Tuesday could never collect anything. The
+     * schedule the seller set, the disclosure the customer read, and the whole state machine of
+     * grace and late fees were all sitting on a rail that had no way to take money.
+     *
+     * Saved from the ACCEPTANCE charge (the one moment the customer is present and entering a
+     * card) and reused off-session thereafter. The acceptance screen says so before they pay:
+     * storing a credential without telling the payer is what the card-network rules exist to stop.
+     *
+     * Null means there is nothing to charge against, and the sweep says so plainly rather than
+     * marking the customer delinquent for a card we never kept.
+     */
+    payment_method_ref: { type: String, default: null },
+    /**
+     * §49 — the bank asked the customer to authenticate this instalment (SCA/3-D Secure). NOT a
+     * decline, and it must never be treated as one: the customer has done nothing wrong and their
+     * card is fine. Holds the intent they need to confirm, so the app can hand them straight to it.
+     */
+    action_required_intent_ref: { type: String, default: null },
+    action_required_installment: { type: Number, default: null },
 
     /**
      * §50 — the remedies a seller can offer instead of letting an agreement fail.

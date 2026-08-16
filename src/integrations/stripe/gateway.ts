@@ -78,11 +78,27 @@ export class StripeConnectGateway implements StripeGateway {
     });
   }
 
-  async createDestinationCharge(
-    input: DestinationChargeInput,
-  ): Promise<{ paymentIntentId: string; clientSecret: string | null; status: string }> {
+  async createDestinationCharge(input: DestinationChargeInput): Promise<{
+    paymentIntentId: string;
+    clientSecret: string | null;
+    status: string;
+    paymentMethodId?: string | null;
+  }> {
     // Note: PaymentIntents do not take automatic_tax (that lives on Checkout/Invoices). Stripe Tax
     // for direct charges is computed via a Checkout Session or the Tax API — wired in a later phase.
+    const customerId = input.customerRef
+      ? (await this.ensureCustomer(input.customerRef)).customerId
+      : undefined;
+
+    /**
+     * Off-session means: confirm NOW, against a card already on file, with nobody present. It is
+     * what turns a scheduled instalment into an actual collection — an on-session intent just waits
+     * for a human who is asleep. `error_on_requires_action` is deliberately NOT set: an SCA
+     * challenge is a real outcome the caller must be able to see and act on, and collapsing it into
+     * an exception would make it indistinguishable from a decline.
+     */
+    const offSession = Boolean(input.offSession && input.paymentMethodId);
+
     const intent = await this.client.paymentIntents.create(
       {
         amount: input.amountCents,
@@ -91,6 +107,17 @@ export class StripeConnectGateway implements StripeGateway {
         transfer_data: { destination: input.destinationAccountId },
         transfer_group: input.transferGroup,
         metadata: input.metadata,
+        ...(customerId ? { customer: customerId } : {}),
+        // Keeps the card for later instalments. The payer is told this on the acceptance screen —
+        // storing a credential silently is exactly what the network rules forbid.
+        ...(input.savePaymentMethod ? { setup_future_usage: 'off_session' as const } : {}),
+        ...(offSession
+          ? {
+              payment_method: input.paymentMethodId,
+              off_session: true as const,
+              confirm: true as const,
+            }
+          : {}),
       },
       { idempotencyKey: input.idempotencyKey },
     );
@@ -98,6 +125,50 @@ export class StripeConnectGateway implements StripeGateway {
       paymentIntentId: intent.id,
       clientSecret: intent.client_secret,
       status: intent.status,
+      paymentMethodId:
+        typeof intent.payment_method === 'string'
+          ? intent.payment_method
+          : (intent.payment_method?.id ?? null),
+    };
+  }
+
+  async ensureCustomer(customerRef: string, email?: string): Promise<{ customerId: string }> {
+    return { customerId: await this.customerFor(customerRef, email) };
+  }
+
+  async createSetupIntent(input: {
+    customerRef: string;
+    metadata: Record<string, string>;
+    idempotencyKey: string;
+  }): Promise<{ setupIntentId: string; clientSecret: string | null; status: string }> {
+    const customerId = await this.customerFor(input.customerRef);
+    const intent = await this.client.setupIntents.create(
+      {
+        customer: customerId,
+        // The card is being kept precisely so it can be charged when nobody is present.
+        usage: 'off_session',
+        metadata: input.metadata,
+      },
+      { idempotencyKey: input.idempotencyKey },
+    );
+    return {
+      setupIntentId: intent.id,
+      clientSecret: intent.client_secret,
+      status: intent.status,
+    };
+  }
+
+  async retrieveSetupIntent(
+    id: string,
+  ): Promise<{ id: string; status: string; paymentMethodId?: string | null }> {
+    const intent = await this.client.setupIntents.retrieve(id);
+    return {
+      id: intent.id,
+      status: intent.status,
+      paymentMethodId:
+        typeof intent.payment_method === 'string'
+          ? intent.payment_method
+          : (intent.payment_method?.id ?? null),
     };
   }
 
@@ -129,11 +200,24 @@ export class StripeConnectGateway implements StripeGateway {
     };
   }
 
-  async retrievePaymentIntent(
-    id: string,
-  ): Promise<{ id: string; status: string; amountCents: number }> {
+  async retrievePaymentIntent(id: string): Promise<{
+    id: string;
+    status: string;
+    amountCents: number;
+    paymentMethodId?: string | null;
+    clientSecret?: string | null;
+  }> {
     const intent = await this.client.paymentIntents.retrieve(id);
-    return { id: intent.id, status: intent.status, amountCents: intent.amount };
+    return {
+      id: intent.id,
+      status: intent.status,
+      amountCents: intent.amount,
+      paymentMethodId:
+        typeof intent.payment_method === 'string'
+          ? intent.payment_method
+          : (intent.payment_method?.id ?? null),
+      clientSecret: intent.client_secret,
+    };
   }
 
   async createRefund(input: {
@@ -258,13 +342,16 @@ export class StripeConnectGateway implements StripeGateway {
    * this used to) left an orphan customer in Stripe behind every failed upgrade, and meant a
    * retrying subscriber accumulated duplicates that no longer shared a saved card.
    */
-  private async customerFor(subscriberRef: string): Promise<string> {
+  private async customerFor(subscriberRef: string, email?: string): Promise<string> {
     const found = await this.client.customers.search({
       query: `metadata['subscriberRef']:'${subscriberRef}'`,
       limit: 1,
     });
     if (found.data[0]) return found.data[0].id;
-    const created = await this.client.customers.create({ metadata: { subscriberRef } });
+    const created = await this.client.customers.create({
+      metadata: { subscriberRef },
+      ...(email ? { email } : {}),
+    });
     return created.id;
   }
 

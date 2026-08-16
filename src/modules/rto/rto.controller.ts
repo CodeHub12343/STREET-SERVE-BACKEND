@@ -64,6 +64,12 @@ export const rtoController = {
     const { id } = params<z.infer<typeof AgreementIdParam>>(req);
     ok(res, await rtoService.getDashboard(principal(req), id));
   },
+  /** Pay an instalment the sweep could not collect (SCA challenge, or no card on file). */
+  resumePayment: async (req: Request, res: Response): Promise<void> => {
+    const { id } = params<z.infer<typeof AgreementIdParam>>(req);
+    ok(res, await rtoService.resumeInstallment(principal(req), id, idemKey(req)));
+  },
+
   payoff: async (req: Request, res: Response): Promise<void> => {
     const { id } = params<z.infer<typeof AgreementIdParam>>(req);
     ok(res, await rtoService.payoff(principal(req), id, idemKey(req)));

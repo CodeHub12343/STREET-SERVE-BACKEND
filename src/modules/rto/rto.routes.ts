@@ -193,6 +193,22 @@ rtoRouter.post(
 );
 
 /**
+ * Finish an instalment the automatic charge could not take on its own — either because the bank
+ * asked the customer to authenticate (SCA), or because there is no saved card to charge. Money +
+ * idempotent, like every other charge path: a double tap here would be a double instalment.
+ */
+rtoRouter.post(
+  '/agreements/:id/resume-payment',
+  rateLimit('money'),
+  requireFeature('rto'),
+  authenticate,
+  requirePermission('rto:read_own'),
+  idempotency,
+  validate({ params: AgreementIdParam }),
+  asyncHandler(rtoController.resumePayment),
+);
+
+/**
  * §50 seller remedies. Every one is the SELLER's to grant — a customer who could pause their own
  * agreement or move their own due date would not be receiving forbearance, they would have an
  * option to stop paying. The service checks business ownership on each.

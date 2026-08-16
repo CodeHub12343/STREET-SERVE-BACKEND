@@ -188,6 +188,22 @@ export const paymentsService = {
     /** Which registry fee-type applies. Defaults to `marketplace` (regular + wave sales, R7). */
     feeType?: FeeType;
     idempotencyKey: string;
+
+    /**
+     * ═══ Stored credentials, for charges that recur. ═══
+     *
+     * Set `savePaymentMethod` on the FIRST, on-session charge of an agreement to keep the card;
+     * pass `paymentMethodId` + `offSession` on every scheduled one after it. Without this pair a
+     * scheduled charge opens an intent that waits for a human who is not there — which is why a
+     * Rent-to-Own instalment could never actually collect.
+     *
+     * `customerEmail` is only used when the Stripe Customer is created, so a saved card has a
+     * receipt address attached to it rather than being an anonymous token.
+     */
+    savePaymentMethod?: boolean;
+    paymentMethodId?: string;
+    offSession?: boolean;
+    customerEmail?: string;
   }) {
     const existing = await repo.findByIdempotencyKey(input.idempotencyKey);
     if (existing) {
@@ -259,6 +275,14 @@ export const paymentsService = {
       metadata: { transactionId: txnId, counterpartyId: input.counterpartyId },
       idempotencyKey: input.idempotencyKey,
       automaticTax: env.STRIPE_TAX_ENABLED,
+      /**
+       * The customer is attached whenever we intend to keep the card OR are spending one already
+       * kept — Stripe requires a Customer for both halves of a stored credential.
+       */
+      ...(input.savePaymentMethod || input.offSession ? { customerRef: input.customerId } : {}),
+      ...(input.savePaymentMethod ? { savePaymentMethod: true } : {}),
+      ...(input.paymentMethodId ? { paymentMethodId: input.paymentMethodId } : {}),
+      ...(input.offSession ? { offSession: true } : {}),
     });
 
     await repo.setPaymentIntentRef(txnId, charge.paymentIntentId);
@@ -267,7 +291,16 @@ export const paymentsService = {
       transactionId: txnId,
       paymentIntentRef: charge.paymentIntentId,
       clientSecret: charge.clientSecret,
+      /**
+       * Terminal for an off-session charge (`succeeded`, `requires_action`, or a decline via a
+       * thrown error); `requires_payment_method` for an ordinary on-session one. Callers that
+       * schedule payments MUST read this — `requires_action` is a bank asking the customer to
+       * authenticate, not a refusal, and treating it as a failure would push someone into
+       * delinquency for their bank's security policy.
+       */
       status: charge.status,
+      /** The card Stripe used. Captured by recurring callers so the next instalment can reuse it. */
+      paymentMethodRef: charge.paymentMethodId ?? null,
       platformFeeCents: platformFee,
       counterpartyNetCents: counterpartyNet,
       replay: false,
@@ -285,6 +318,17 @@ export const paymentsService = {
    */
   findTransactionByPaymentIntent(paymentIntentRef: string) {
     return repo.findTransactionByPaymentIntent(paymentIntentRef);
+  },
+
+  /**
+   * The client secret for an intent that already exists, so a stuck payment can be finished rather
+   * than duplicated. Used where a charge needs the customer to come back and act on it — an SCA
+   * challenge on a scheduled instalment being the case that matters. Opening a fresh charge there
+   * would take the money twice if the original later confirms.
+   */
+  async clientSecretFor(paymentIntentRef: string): Promise<string | null> {
+    const intent = await stripe().retrievePaymentIntent(paymentIntentRef);
+    return intent.clientSecret ?? null;
   },
 
   /** Webhook-driven completion: pending → completed (immutable thereafter). */

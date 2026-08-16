@@ -80,6 +80,15 @@ stripeWebhookRouter.post(
         await paymentsService.completeByPaymentIntent(String(obj.id));
         break;
       }
+      /**
+       * A card was stored without a payment being taken — a Rent-to-Own agreement that owed nothing
+       * on day one but whose twelve scheduled instalments still need something to charge. No money
+       * moves here; this only attaches the credential.
+       */
+      case 'setup_intent.succeeded': {
+        await rtoService.attachCardBySetupIntent(String(obj.id));
+        break;
+      }
       case 'payment_intent.payment_failed': {
         const reason =
           (obj.last_payment_error as { message?: string } | undefined)?.message ?? 'payment_failed';

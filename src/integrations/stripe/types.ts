@@ -18,6 +18,32 @@ export interface DestinationChargeInput {
   metadata: Record<string, string>;
   idempotencyKey: string;
   automaticTax?: boolean;
+
+  /**
+   * ═══ STORED CREDENTIALS — the rail recurring charges need. ═══
+   *
+   * A destination charge with none of these is an ON-SESSION charge: it opens an intent and waits
+   * for a human to type a card. That is right for a checkout and useless for anything scheduled —
+   * a Rent-to-Own instalment falls due at 3am on a Tuesday and there is nobody there to type
+   * anything. Without a stored credential the recurring half of Rent-to-Own cannot collect a penny,
+   * whatever else is fixed.
+   *
+   * `customerRef` attaches the intent to a Stripe Customer (ours is keyed by user id, so the same
+   * person is one customer across every module). `savePaymentMethod` asks Stripe to keep the card
+   * for later off-session use — which is why the acceptance screen has to SAY so; a stored
+   * credential the payer was not told about is the thing card-network rules exist to prevent.
+   */
+  customerRef?: string;
+  savePaymentMethod?: boolean;
+
+  /**
+   * Charge a card that is already on file, with nobody present. `paymentMethodId` + `offSession`
+   * make Stripe confirm immediately, so the returned `status` is terminal (`succeeded`) rather
+   * than the usual `requires_payment_method` — or `requires_action` when the bank demands the
+   * customer authenticate, which is NOT a decline and must never be treated as one.
+   */
+  paymentMethodId?: string;
+  offSession?: boolean;
 }
 
 export interface StripeAccountStatus {
@@ -51,7 +77,41 @@ export interface StripeGateway {
 
   createDestinationCharge(
     input: DestinationChargeInput,
-  ): Promise<{ paymentIntentId: string; clientSecret: string | null; status: string }>;
+  ): Promise<{
+    paymentIntentId: string;
+    clientSecret: string | null;
+    status: string;
+    /** The card Stripe ended up using — captured so later instalments can reuse it. */
+    paymentMethodId?: string | null;
+  }>;
+
+  /**
+   * The Stripe Customer for one of our users, created on first use. Keyed by our own id in
+   * metadata so the same person is one customer across subscriptions, Rent-to-Own and anything
+   * else that ever needs a card on file.
+   */
+  ensureCustomer(customerRef: string, email?: string): Promise<{ customerId: string }>;
+
+  /**
+   * Collect and store a card WITHOUT charging it.
+   *
+   * The case this exists for: an agreement with no deposit and no set-up fee. Nothing is owed on
+   * day one, so there is no payment to attach `setup_future_usage` to — and without a card the
+   * twelve scheduled instalments after it can never be collected. A zero-amount PaymentIntent is
+   * not a thing Stripe will create, so a SetupIntent is the only way to ask for a card at the one
+   * moment the customer is actually present.
+   */
+  createSetupIntent(input: {
+    customerRef: string;
+    metadata: Record<string, string>;
+    idempotencyKey: string;
+  }): Promise<{ setupIntentId: string; clientSecret: string | null; status: string }>;
+
+  retrieveSetupIntent(id: string): Promise<{
+    id: string;
+    status: string;
+    paymentMethodId?: string | null;
+  }>;
 
   /**
    * SEPARATE CHARGES AND TRANSFERS (Phase 2). Funds land on the PLATFORM balance rather than being
@@ -67,7 +127,19 @@ export interface StripeGateway {
     idempotencyKey: string;
     receiptEmail?: string;
   }): Promise<{ paymentIntentId: string; clientSecret: string | null; status: string }>;
-  retrievePaymentIntent(id: string): Promise<{ id: string; status: string; amountCents: number }>;
+  retrievePaymentIntent(id: string): Promise<{
+    id: string;
+    status: string;
+    amountCents: number;
+    /** Present once a card has been attached — the reconcile paths capture it for reuse. */
+    paymentMethodId?: string | null;
+    /**
+     * So a payment that stalled can be FINISHED rather than duplicated. An intent needing the
+     * customer to authenticate already holds the money; opening a second charge for it would take
+     * the amount twice if the first one later confirms.
+     */
+    clientSecret?: string | null;
+  }>;
   createRefund(input: {
     paymentIntentId: string;
     amountCents?: number;
