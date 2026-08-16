@@ -117,6 +117,25 @@ export const deliveryService = {
     if (order.status === 'cancelled' || order.status === 'completed') {
       throw BusinessRuleError(ERROR_CODES.BUSINESS_RULE, 'This order is already finished');
     }
+    /**
+     * ═══ Not before the customer has paid. ═══
+     *
+     * Placing an order only OPENS the charge; `pending_payment` means the card has not been
+     * confirmed. Dispatching against one would send a real person on a real journey — and commit
+     * the vendor to a payout they owe whatever happens — for an order that may never be paid for.
+     * The driver has done the work by then, so it cannot be unwound: they are owed, and the money
+     * to cover them never arrived.
+     *
+     * The vendor's board only offers this on an accepted order, and an unpaid order cannot be
+     * accepted, so this is not reachable through the UI. It is enforced here because "the client
+     * would not do that" is not a rule — it is an assumption about a caller we do not control.
+     */
+    if (order.status === 'pending_payment') {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'This order has not been paid for yet — you can request a driver once the payment goes through',
+      );
+    }
 
     const existing = await DeliveryRequestModel.findOne({ order_id: input.orderId }).lean();
     if (existing) {

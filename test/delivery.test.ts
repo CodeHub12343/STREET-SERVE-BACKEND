@@ -6,6 +6,7 @@ import { setStripeGateway } from '../src/integrations/stripe';
 import { CategoryModel, CityModel } from '../src/modules/catalog/catalog.model';
 import { ConnectedAccountModel } from '../src/modules/payments/payments.model';
 import { OrderModel } from '../src/modules/orders/orders.model';
+import { TransactionModel } from '../src/modules/payments/payments.model';
 import {
   DeliveryIncidentModel,
   DeliveryRequestModel,
@@ -121,7 +122,31 @@ async function vendorWithOrder(prefix: string) {
       },
     });
 
-  return { token, custToken, businessId, orderId: order.body.data.id as string };
+  const orderId = order.body.data.id as string;
+
+  /**
+   * Pay for it. Placing an order only OPENS the charge, and a driver may not be dispatched against
+   * an unpaid one — sending a real person on a real journey for an order that may never be paid for
+   * commits the vendor to a payout they cannot unwind. Settling here makes every test below walk
+   * the chain a real delivery actually walks.
+   */
+  const placed = await OrderModel.findById(orderId).lean();
+  const txn = await TransactionModel.findById(placed!.transaction_id).lean();
+  if (txn?.payment_intent_ref) {
+    await request(app)
+      .post('/webhooks/stripe')
+      .set('stripe-signature', 'test')
+      .set('content-type', 'application/json')
+      .send(
+        JSON.stringify({
+          id: `evt_${Math.random()}`,
+          type: 'payment_intent.succeeded',
+          data: { object: { id: txn.payment_intent_ref } },
+        }),
+      );
+  }
+
+  return { token, custToken, businessId, orderId };
 }
 
 /** An approved, on-shift driver near the pickup. */
@@ -835,5 +860,51 @@ describe('the launch gate', () => {
   it('has no orphaned deliveries left behind by these tests', async () => {
     const stuck = await OrderModel.countDocuments({ fulfillment_type: 'delivery' });
     expect(stuck).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * ═══ A driver is not dispatched against money that has not arrived. ═══
+ *
+ * `request` refused a cancelled or completed order and nothing else, so a `pending_payment` one —
+ * an order whose card has only been OPENED, never confirmed — would dispatch. That sends a real
+ * person on a real journey and commits the vendor to a payout they owe whatever happens; by the
+ * time the payment fails the driver has done the work and is owed for it.
+ *
+ * Not reachable through the vendor's board, which only offers this on an accepted order. Enforced
+ * anyway, because "the client would not do that" is an assumption about a caller we do not control.
+ */
+describe('delivery: dispatch waits for the customer to actually pay', () => {
+  it('refuses a driver request for an order whose payment has not settled', async () => {
+    const prefix = 'dan-unpaid';
+    // Reuses the standard fixture for the vendor, business and live session; the order it makes is
+    // paid, so this test places a SECOND one and deliberately leaves it unsettled.
+    const { token, custToken, businessId } = await vendorWithOrder(prefix);
+
+    const item = await request(app)
+      .post(`/api/v1/businesses/${businessId}/menu`)
+      .set(...bearer(token))
+      .send({ name: 'Unpaid plate', priceCents: 2000 });
+
+    const order = await request(app)
+      .post('/api/v1/orders')
+      .set(...bearer(custToken))
+      .set('Idempotency-Key', `${prefix}_order_2`)
+      .send({
+        businessId,
+        items: [{ menuItemId: item.body.data.id, quantity: 1 }],
+        destination: { line1: '9 Unpaid Way', city: 'Testville', lng: -121.002, lat: 37.602 },
+      });
+    expect(order.status).toBe(201);
+
+    // Deliberately NOT settled — this is the unpaid case.
+    expect((await OrderModel.findById(order.body.data.id).lean())!.status).toBe('pending_payment');
+
+    const res = await request(app)
+      .post('/api/v1/deliveries')
+      .set(...bearer(token))
+      .send({ orderId: order.body.data.id, driverPayoutCents: 500 });
+    expect([400, 422]).toContain(res.status);
+    expect(res.body.error.message).toMatch(/not been paid for/i);
   });
 });
