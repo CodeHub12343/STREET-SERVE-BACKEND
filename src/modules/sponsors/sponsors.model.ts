@@ -13,6 +13,18 @@ const SponsorSchema = new Schema(
     tier: { type: String, default: 'launch' },
     launch_city_slug: { type: String, default: null },
     utm_code: { type: String, required: true, unique: true },
+    /**
+     * What the sponsor agreed to pay, RECORDED BY HAND.
+     *
+     * Deliberately not a payment rail: no Stripe, no invoice, nothing collected. Sponsorships are
+     * negotiated and settled off-platform, and this module describes itself as record-keeping for
+     * the pilot. The admin table has always shown a "Spend" column against no field at all — the
+     * figure came from a demo fixture — so it was reporting a number nobody had entered and nothing
+     * could verify. A hand-entered figure is honest about what it is; an invented one is not.
+     */
+    contracted_cents: { type: Number, default: 0 },
+    /** Free-text note for the arrangement — term, deliverables, who signed it. */
+    note: { type: String, default: null },
     impressions_count: { type: Number, default: 0 },
     attributed_signups_count: { type: Number, default: 0 },
     active: { type: Boolean, default: true },

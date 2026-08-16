@@ -77,6 +77,21 @@ const CreateSponsorBody = z
     logoUrl: z.string().url().max(2048).optional(),
     tier: z.string().max(40).optional(),
     launchCitySlug: z.string().max(64).optional(),
+    /** Recorded by hand. Nothing is collected — see the model. */
+    contractedCents: z.number().int().min(0).max(100_000_000).optional(),
+    note: z.string().max(500).optional(),
+  })
+  .strict();
+const UpdateSponsorBody = z
+  .object({
+    name: z.string().min(1).max(160).optional(),
+    logoUrl: z.string().url().max(2048).nullable().optional(),
+    tier: z.string().max(40).optional(),
+    launchCitySlug: z.string().max(64).nullable().optional(),
+    contractedCents: z.number().int().min(0).max(100_000_000).optional(),
+    note: z.string().max(500).nullable().optional(),
+    /** False ends the sponsorship: the logo comes down and the UTM stops attributing. */
+    active: z.boolean().optional(),
   })
   .strict();
 const IdParam = z.object({ id: z.string().length(24) }).strict();
@@ -91,6 +106,39 @@ sponsorsAdminRouter.post(
     created(
       res,
       await sponsorsService.create(principal(req), body<z.infer<typeof CreateSponsorBody>>(req)),
+    );
+  }),
+);
+
+/**
+ * The roster. This did not exist, so the admin screen requested it, got a 404, and sat on its
+ * loading skeleton for ever — a page that could only ever be blank.
+ */
+sponsorsAdminRouter.get(
+  '/sponsors',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('admin:manage_sponsors'),
+  asyncHandler(async (_req: Request, res: Response) => {
+    ok(res, await sponsorsService.listAll());
+  }),
+);
+
+/** Edit a sponsorship, including ending one — `active` was previously reachable by nothing. */
+sponsorsAdminRouter.patch(
+  '/sponsors/:id',
+  rateLimit('write'),
+  authenticate,
+  requirePermission('admin:manage_sponsors'),
+  validate({ params: IdParam, body: UpdateSponsorBody }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(
+      res,
+      await sponsorsService.update(
+        principal(req),
+        params<z.infer<typeof IdParam>>(req).id,
+        body<z.infer<typeof UpdateSponsorBody>>(req),
+      ),
     );
   }),
 );

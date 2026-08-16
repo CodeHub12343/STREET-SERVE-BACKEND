@@ -51,6 +51,107 @@ describe('security headers', () => {
   });
 });
 
+/**
+ * ═══ The admin roster, which did not exist. ═══
+ *
+ * The sponsor screen called `GET /admin/sponsors`, got a 404, and rendered its loading skeleton for
+ * ever — a page that could only ever be blank. And `active` sat in the model reachable by nothing,
+ * so a sponsorship could be created and never ended: the logo would stay on the landing page after
+ * the term expired, and the UTM code would keep attributing signups to a partner who had stopped
+ * paying.
+ */
+describe('sponsors: the admin roster and ending a sponsorship', () => {
+  it('lists every sponsor with real counters, and never invents a spend figure', async () => {
+    await seedUser({ authProviderId: 'p8roster|admin', roles: ['admin'] });
+    const admin = await mintToken('p8roster|admin');
+
+    await request(app)
+      .post('/api/v1/admin/sponsors')
+      .set(...bearer(admin))
+      .send({
+        name: 'Valley Credit Union',
+        utmCode: 'p8-vcu',
+        tier: 'silver',
+        // Recorded by hand — the column used to render a number from a demo fixture.
+        contractedCents: 250_000,
+        note: '6-month launch term',
+      })
+      .expect(201);
+
+    const list = await request(app).get('/api/v1/admin/sponsors').set(...bearer(admin));
+    expect(list.status).toBe(200);
+
+    const row = (list.body.data as { utmCode: string }[]).find((s) => s.utmCode === 'p8-vcu');
+    expect(row).toMatchObject({
+      name: 'Valley Credit Union',
+      tier: 'silver',
+      active: true,
+      contractedCents: 250_000,
+      // Real stored counters, starting where they genuinely start.
+      impressions: 0,
+      attributedSignups: 0,
+    });
+  });
+
+  it('ends a sponsorship: the logo comes down and the UTM stops attributing', async () => {
+    await seedUser({ authProviderId: 'p8end|admin', roles: ['admin'] });
+    const admin = await mintToken('p8end|admin');
+
+    const create = await request(app)
+      .post('/api/v1/admin/sponsors')
+      .set(...bearer(admin))
+      .send({ name: 'Expired Co', utmCode: 'p8-expired' });
+    const sponsorId = create.body.data.id as string;
+
+    await request(app).post('/api/v1/sponsors/impression').send({ utmCode: 'p8-expired' });
+
+    const ended = await request(app)
+      .patch(`/api/v1/admin/sponsors/${sponsorId}`)
+      .set(...bearer(admin))
+      .send({ active: false });
+    expect(ended.status).toBe(200);
+    expect(ended.body.data.active).toBe(false);
+    // What they finished with, reported rather than left to vanish from the screen.
+    expect(ended.body.data.impressions).toBe(1);
+
+    // The logo is off the public list…
+    const publicList = await request(app).get('/api/v1/sponsors');
+    expect(
+      (publicList.body.data as { name: string }[]).some((s) => s.name === 'Expired Co'),
+    ).toBe(false);
+
+    // …the UTM no longer attributes a signup to them…
+    const prereg = await request(app).post('/api/v1/preregistrations').send({
+      fullName: 'Late Arrival',
+      email: 'late-arrival@example.com',
+      utmCode: 'p8-expired',
+    });
+    expect(prereg.status).toBe(201);
+    expect(prereg.body.data.attributedToSponsor).toBe(false);
+
+    // …and no further impressions are counted against them.
+    await request(app).post('/api/v1/sponsors/impression').send({ utmCode: 'p8-expired' });
+    const report = await request(app)
+      .get(`/api/v1/admin/sponsors/${sponsorId}/report`)
+      .set(...bearer(admin));
+    expect(report.body.data.impressions).toBe(1);
+
+    // But the record survives on the admin roster — a finished term is what an operator looks for.
+    const list = await request(app).get('/api/v1/admin/sponsors').set(...bearer(admin));
+    const row = (list.body.data as { name: string; active: boolean }[]).find(
+      (s) => s.name === 'Expired Co',
+    );
+    expect(row!.active).toBe(false);
+  });
+
+  it('keeps the roster and edits admin-only', async () => {
+    await seedUser({ authProviderId: 'p8auth|vendor', roles: ['vendor'] });
+    const vendor = await mintToken('p8auth|vendor');
+    const list = await request(app).get('/api/v1/admin/sponsors').set(...bearer(vendor));
+    expect([401, 403]).toContain(list.status);
+  });
+});
+
 describe('sponsors: admin CRUD + public logo list + UTM attribution', () => {
   it('creates a sponsor, lists it publicly, attributes a pre-registration, and reports', async () => {
     await seedUser({ authProviderId: 'p8|admin', roles: ['admin'] });
