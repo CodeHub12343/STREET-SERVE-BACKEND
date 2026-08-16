@@ -118,6 +118,32 @@ async function userBriefFor(ids: string[]): Promise<Map<string, UserBrief>> {
  * amount computed from the distance; a channel that could change either would turn "where shall I
  * leave it?" into a negotiation with someone whose food is going cold.
  */
+/**
+ * Who may talk about a Rent-to-Own agreement: the customer paying it off and whoever owns the
+ * business they are paying.
+ *
+ * The longest-running relationship in the product — twelve instalments over a year — and until now
+ * the only one with no way to say anything. §50 gives the seller remedies (more time, a part
+ * payment, a catch-up plan, a pause) and the dashboard tells a customer in Grace to "message the
+ * seller", which was an instruction with nothing behind it. This is what that copy meant.
+ *
+ * Deliberately open for the WHOLE life of the agreement, including after it completes or is
+ * cancelled: a dispute about a paid-off item, or about a return, arrives after the money stops.
+ */
+async function participantsForRtoAgreement(
+  agreementId: string,
+): Promise<{ userIds: string[]; title: string } | null> {
+  const { RtoAgreementModel } = await import('../rto/rto.model');
+  const agreement = await RtoAgreementModel.findById(agreementId).lean().exec();
+  if (!agreement) return null;
+  const owner = await vendorsService.getBusinessOwner(agreement.seller_id);
+  if (!owner) return null;
+  return {
+    userIds: [...new Set([agreement.customer_id, owner])],
+    title: agreement.product_name ?? 'Rent to own',
+  };
+}
+
 async function participantsForDelivery(
   deliveryId: string,
 ): Promise<{ userIds: string[]; title: string } | null> {
@@ -190,7 +216,7 @@ export const messagingService = {
    */
   async openForSubject(
     principal: Principal,
-    subjectType: 'consignment' | 'job' | 'delivery',
+    subjectType: 'consignment' | 'job' | 'delivery' | 'rto',
     subjectRefId: string,
   ) {
     const participants =
@@ -198,7 +224,9 @@ export const messagingService = {
         ? await participantsForCheckout(subjectRefId)
         : subjectType === 'delivery'
           ? await participantsForDelivery(subjectRefId)
-          : await participantsForEngagement(subjectRefId);
+          : subjectType === 'rto'
+            ? await participantsForRtoAgreement(subjectRefId)
+            : await participantsForEngagement(subjectRefId);
 
     if (!participants) throw NotFoundError('That work no longer exists');
     if (!participants.userIds.includes(principal.userId)) {
@@ -404,7 +432,9 @@ export const messagingService = {
               ? 'Consignment'
               : t.subject_type === 'delivery'
                 ? 'Delivery'
-                : 'Job',
+                : t.subject_type === 'rto'
+                  ? 'Rent to own'
+                  : 'Job',
           cp: { name: u?.name ?? 'Member', avatarUrl: u?.photoUrl ?? null, userId: otherId },
         };
       }

@@ -22,6 +22,7 @@ import { defineModel } from '../../shared/defineModel';
  *   consignment  — a hub and the seller holding its stock, keyed on the checkout
  *   job          — the poster and the worker, keyed on the engagement
  *   delivery     — the driver and the customer, keyed on the delivery
+ *   rto          — the customer and the seller, keyed on the agreement
  *
  * The subject is also the ACCESS RULE. `startThread` already refused to open a customer↔business
  * thread without a live booking or order, because messaging is where two parties settle a job they
@@ -40,7 +41,7 @@ const MessageThreadSchema = new Schema(
 
     subject_type: {
       type: String,
-      enum: ['business', 'consignment', 'job', 'delivery'],
+      enum: ['business', 'consignment', 'job', 'delivery', 'rto'],
       default: 'business',
       index: true,
     },
