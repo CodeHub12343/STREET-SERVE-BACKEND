@@ -711,6 +711,7 @@ export const ordersService = {
     tip_cents?: number | null;
     round_up_cents?: number | null;
     total_cents: number;
+    pay_it_forward_cents?: number | null;
     transaction_id?: string | null;
     fulfillment_type?: string | null;
     created_at?: Date;
@@ -745,6 +746,20 @@ export const ordersService = {
       totalCents: o.total_cents,
       breakdown,
       transactionId: o.transaction_id ?? null,
+      /**
+       * ═══ What the community fund covered, and what is actually left to pay. ═══
+       *
+       * `total_cents` is what the MEAL cost — deliberately, so refunds and impact figures have the
+       * real sale value. But a client reading only that cannot tell a fully covered order from an
+       * unpaid one, and the payment screen consequently told customers "this payment session
+       * expired, nothing was charged" at the exact moment Pay It Forward had worked perfectly: the
+       * order was placed, the vendor was making it, and nothing more was owed.
+       *
+       * `amountDueCents` is the number a payment screen should act on. Zero means finished, not
+       * broken.
+       */
+      payItForwardCents: o.pay_it_forward_cents ?? 0,
+      amountDueCents: Math.max(0, o.total_cents - (o.pay_it_forward_cents ?? 0)),
       /**
        * Exposed so a client can tell a collection from a delivery.
        *

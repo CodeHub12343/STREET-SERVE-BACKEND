@@ -607,6 +607,51 @@ describe('3b · redemption, caps and the daily limit', () => {
     expect(fund?.balance_cents).toBe(3000);
   });
 
+  /**
+   * ═══ A fully covered order must be able to SAY it is fully covered. ═══
+   *
+   * `total_cents` is what the meal cost — deliberately, so refunds and impact have the real sale
+   * value. But the order read model exposed only that, so a client could not tell a covered order
+   * from an unpaid one. The payment screen consequently showed "This payment session expired —
+   * nothing was charged" at the exact moment Pay It Forward had worked perfectly: order placed,
+   * vendor already cooking, nothing more owed. The likely response is a second order, or walking
+   * away from food someone had bought.
+   */
+  it('reports nothing owed on a fully covered order', async () => {
+    const v = await vendorWithMenu('pf-nothingdue');
+    const giver = await customer('pf-nothingdue-give');
+    const buyer = await customer('pf-nothingdue-buy');
+    await contributeAndSettle(giver, v.businessId, 20_000, 'pf_nothingdue_1');
+
+    const res = await placeOrder(
+      buyer,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'pf_nothingdue_order',
+    );
+    expect(res.status).toBe(201);
+
+    // No card was taken at all — the moment the whole feature exists for.
+    expect(res.body.data.transactionId ?? null).toBeNull();
+    expect(res.body.data.payment ?? null).toBeNull();
+
+    // …and the read model says so, rather than leaving the client to infer it from a missing charge.
+    expect(res.body.data.amountDueCents).toBe(0);
+    expect(res.body.data.payItForwardCents).toBe(res.body.data.totalCents);
+    // The order's own total is still what the MEAL cost, for refunds and impact.
+    expect(res.body.data.totalCents).toBeGreaterThan(0);
+
+    // The same facts survive a re-read, which is what a refresh on the payment URL does.
+    const mine = await request(app).get('/api/v1/orders/mine').set(...bearer(buyer));
+    const row = (mine.body.data as { id: string; amountDueCents: number }[]).find(
+      (o) => o.id === res.body.data.id,
+    );
+    expect(row!.amountDueCents).toBe(0);
+  });
+
   it('covers part of an order and charges the customer the rest', async () => {
     const v = await vendorWithMenu('pf-part');
     const giver = await customer('pf-part-give');
