@@ -1,9 +1,10 @@
-import { DRIVER_MIN_TIER, TIER_RANK, type DriverVehicleType } from '../../config/constants';
+import { DRIVER_MIN_TIER, TIER_RANK, type DriverVehicleType, type Tier } from '../../config/constants';
 import { reportSweepBatch, SWEEP_BATCH_LIMIT } from '../../jobs/sweepBatch';
 import { writeAudit } from '../../shared/audit';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import { BusinessRuleError, ForbiddenError, NotFoundError } from '../../shared/errors/AppError';
 import type { Principal } from '../../shared/types/principal';
+import { identityRepository } from '../identity/identity.repository';
 import { notificationsService } from '../notifications/notifications.service';
 import { DriverProfileModel } from './delivery.model';
 
@@ -63,9 +64,39 @@ export const driverService = {
       emergencyContactPhone?: string;
     },
   ) {
-    if (TIER_RANK[principal.verificationTier] < TIER_RANK[DRIVER_MIN_TIER]) {
+    /**
+     * ═══ Ask Stripe before refusing them. ═══
+     *
+     * Driving needs Silver, and Silver IS the bank-account verification — which is approved only
+     * when a payout account becomes payouts-enabled. That approval hung entirely off the
+     * `account.updated` webhook, so someone who had finished Stripe onboarding and watched it
+     * succeed was still Bronze, and got told to "verify your identity and bank account" — advice
+     * for something they had already done, with no way to act on it.
+     *
+     * Reconciling here costs one Stripe read on a rare action and turns a permanent block into a
+     * self-correcting one. The tier is re-read afterwards because `principal` was resolved before
+     * any of this ran.
+     */
+    let tier = principal.verificationTier;
+    if (TIER_RANK[tier] < TIER_RANK[DRIVER_MIN_TIER]) {
+      const { paymentsService } = await import('../payments/payments.service');
+      await paymentsService.syncAccountFromStripe('user', principal.userId);
+      const approved = await identityRepository.approvedVerifications(principal.userId);
+      tier = approved.reduce<Tier>(
+        (best, rec) => (TIER_RANK[rec.tier] > TIER_RANK[best] ? rec.tier : best),
+        'tier0',
+      );
+    }
+    if (TIER_RANK[tier] < TIER_RANK[DRIVER_MIN_TIER]) {
       throw ForbiddenError(
-        'Verify your identity and bank account before applying to drive',
+        /**
+         * Names the ONE thing that is actually missing. "Verify your identity and bank account" was
+         * refusing people who had done half of it without saying which half, and identity alone
+         * (Bronze) is never enough — it is always the bank account that is outstanding here.
+         */
+        TIER_RANK[tier] < TIER_RANK['bronze']
+          ? 'Verify your identity before applying to drive — you can do that from your profile'
+          : 'Connect a payout account before applying to drive — drivers are paid straight to their bank, so we need somewhere to send it',
         ERROR_CODES.TIER_TOO_LOW,
       );
     }

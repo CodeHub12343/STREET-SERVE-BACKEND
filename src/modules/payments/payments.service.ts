@@ -331,6 +331,77 @@ export const paymentsService = {
     return intent.clientSecret ?? null;
   },
 
+  /**
+   * ═══ RECONCILE ONE PAYOUT ACCOUNT WITH STRIPE, AND APPLY WHAT FOLLOWS FROM IT. ═══
+   *
+   * Finishing Stripe onboarding is supposed to do three things: update our copy of the account,
+   * approve the pending `bank_account` verification, and lift the user to Silver. All three hung off
+   * the `account.updated` webhook and nothing else.
+   *
+   * So when that webhook does not arrive — not configured, dropped, or simply late — the user is
+   * stranded in a state the product cannot explain to them:
+   *
+   *   • `/profile` shows the bank verification stuck on "pending", for ever.
+   *   • The seller earnings page says "Finish setting up your payout account" about an account
+   *     Stripe considers finished, because `fundsAvailability` reads our stored row and never asks.
+   *   • Applying to drive is refused with "Verify your identity and bank account" — which is
+   *     literally true (driving needs Silver, and Silver IS the bank verification) but reads as an
+   *     accusation to someone who has done exactly that and watched it succeed.
+   *
+   * The read paths already had half of this: `getMyPayoutStatus` and `getBusinessPayouts` re-fetch
+   * from Stripe and update the row. What they never did was the OTHER half — the verification and
+   * the tier — so an account could be visibly connected and payouts-enabled on screen while the user
+   * stayed at Bronze and locked out of everything Silver gates.
+   *
+   * This is the single place both halves happen, and every read path now calls it. A missing webhook
+   * becomes a delay of one page load rather than a permanent block, which is the same reasoning as
+   * the Pay It Forward reconcile sweep: money and permissions a person is actively waiting on must
+   * not depend on a single delivery.
+   */
+  async syncAccountFromStripe(ownerType: OwnerType, ownerId: string) {
+    const account = await repo.findAccountByOwner(ownerType, ownerId);
+    if (!account) return null;
+
+    let live: { chargesEnabled: boolean; payoutsEnabled: boolean; detailsSubmitted: boolean };
+    try {
+      live = await stripe().getAccount(account.stripe_account_id);
+    } catch (err) {
+      // Never let a Stripe outage break a page that merely displays payout status.
+      logger.warn({ err, ownerType, ownerId }, 'could not refresh payout account from Stripe');
+      return account;
+    }
+
+    const becamePayoutEnabled = live.payoutsEnabled && !account.payouts_enabled;
+    const updated = await repo.updateAccountStatus(account.stripe_account_id, {
+      charges_enabled: live.chargesEnabled,
+      payouts_enabled: live.payoutsEnabled,
+      details_submitted: live.detailsSubmitted,
+    });
+
+    /**
+     * The half that was missing. Guarded on the TRANSITION rather than the current value so a page
+     * that is polled does not re-run the approval on every load — `onPayoutsEnabled` is itself
+     * idempotent (it looks for a *pending* record), but doing the work once is the honest shape.
+     */
+    if (becamePayoutEnabled) {
+      try {
+        const { verificationService } = await import('../identity/verification.service');
+        await verificationService.onPayoutsEnabled(ownerType, ownerId);
+      } catch (err) {
+        logger.error(
+          { err, ownerType, ownerId },
+          'payout account enabled but the verification could not be approved',
+        );
+      }
+      try {
+        await this.applyTierSchedule(ownerType, ownerId);
+      } catch (err) {
+        logger.error({ err, ownerType, ownerId }, 'could not apply tier payout schedule');
+      }
+    }
+    return updated ?? account;
+  },
+
   /** Webhook-driven completion: pending → completed (immutable thereafter). */
   async completeByPaymentIntent(paymentIntentRef: string) {
     const txn = await repo.completePendingByPaymentIntent(paymentIntentRef);
@@ -483,18 +554,14 @@ export const paymentsService = {
     let status = { chargesEnabled: false, payoutsEnabled: false, detailsSubmitted: false };
     let balance: { availableCents: number; pendingCents: number; currency: string } | null = null;
     if (account) {
-      const live = await stripe().getAccount(account.stripe_account_id);
+      // Keeps our store in sync so downstream gates (go-live, charge) see the fresh state — and
+      // applies the verification/tier that used to depend solely on the `account.updated` webhook.
+      const synced = await this.syncAccountFromStripe('business', businessId);
       status = {
-        chargesEnabled: live.chargesEnabled,
-        payoutsEnabled: live.payoutsEnabled,
-        detailsSubmitted: live.detailsSubmitted,
+        chargesEnabled: synced?.charges_enabled === true,
+        payoutsEnabled: synced?.payouts_enabled === true,
+        detailsSubmitted: synced?.details_submitted === true,
       };
-      // Keep our store in sync so downstream gates (go-live, charge) see the fresh state too.
-      await repo.updateAccountStatus(account.stripe_account_id, {
-        charges_enabled: live.chargesEnabled,
-        payouts_enabled: live.payoutsEnabled,
-        details_submitted: live.detailsSubmitted,
-      });
       balance = await stripe().getBalance(account.stripe_account_id);
     }
 
@@ -547,17 +614,14 @@ export const paymentsService = {
         balance: null,
       };
     }
-    const live = await stripe().getAccount(account.stripe_account_id);
-    await repo.updateAccountStatus(account.stripe_account_id, {
-      charges_enabled: live.chargesEnabled,
-      payouts_enabled: live.payoutsEnabled,
-      details_submitted: live.detailsSubmitted,
-    });
+    // Reconciles AND grants the verification/tier — this used to sync the row only, so a seller
+    // could see "payouts enabled" here and still be locked out of everything Silver gates.
+    const synced = await this.syncAccountFromStripe('user', userId);
     return {
       connected: true,
-      chargesEnabled: live.chargesEnabled,
-      payoutsEnabled: live.payoutsEnabled,
-      detailsSubmitted: live.detailsSubmitted,
+      chargesEnabled: synced?.charges_enabled === true,
+      payoutsEnabled: synced?.payouts_enabled === true,
+      detailsSubmitted: synced?.details_submitted === true,
       balance: await stripe().getBalance(account.stripe_account_id),
     };
   },
@@ -577,7 +641,13 @@ export const paymentsService = {
    */
   async fundsAvailability(userId: string, tier: Tier) {
     const holdDays = PAYOUT_DELAY_DAYS_BY_TIER[tier];
-    const account = await repo.findAccountByOwner('user', userId);
+    /**
+     * Reconciled first. This read the STORED row, so a seller whose `account.updated` webhook never
+     * arrived was told "Finish setting up your payout account" about an account Stripe considered
+     * finished — the single most confusing thing this screen can say, because the remedy it offers
+     * is the thing they have already done.
+     */
+    const account = await this.syncAccountFromStripe('user', userId);
 
     // Dynamic import: consignment.service imports THIS module, so a static import would close a
     // require cycle. Same pattern the settlement path uses for subscriptions.
