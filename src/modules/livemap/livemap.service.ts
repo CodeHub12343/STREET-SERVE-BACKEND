@@ -374,33 +374,6 @@ export const livemapService = {
     /**
      * ═══ A seller pin needs a NAME. ═══
      *
-     * A seller has no business behind them, so `name` was left null on their pin and shipped that
-     * way to the client. Nothing had ever noticed, because until street sellers could go live no
-     * seller pin could exist — the moment they could, `Avatar` called `.trim()` on null during
-     * render and React escalated it to the route boundary, taking out the whole /map page.
-     *
-     * `Avatar` is hardened separately, because a missing name must never be a page-level crash. But
-     * the real fix is here: send the name we have.
-     */
-    const sellerNames = new Map<string, { name: string | null; photoUrl: string | null }>();
-    if (sellerIds.length > 0) {
-      const sellerUsers = await UserModel.find(
-        { _id: { $in: sellerIds } },
-        { display_name: 1, photo_url: 1 },
-      )
-        .lean()
-        .exec();
-      for (const u of sellerUsers) {
-        sellerNames.set(String(u._id), {
-          name: u.display_name ?? null,
-          photoUrl: u.photo_url ?? null,
-        });
-      }
-    }
-
-    /**
-     * ═══ A seller pin needs a NAME. ═══
-     *
      * A seller has no business behind them, so `name` was left null on their pin and sent that way.
      * Nothing had ever noticed, because until street sellers could go live no seller pin could
      * exist — the moment they could, `Avatar` called `.trim()` on null DURING RENDER and React
