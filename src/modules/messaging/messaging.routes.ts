@@ -38,6 +38,32 @@ messageThreadsRouter.post(
   }),
 );
 
+/**
+ * Open the thread for a piece of work — a consignment checkout, or a job.
+ *
+ * Separate from `POST /` because the two authorise differently and must not be confused: that one
+ * takes a business id and gates on the caller having an order or booking with it, this one takes
+ * the work itself and reads its members straight off the record. There is no way to name your own
+ * counterparty here, which is exactly the property that keeps it safe to expose.
+ */
+const OpenSubjectBody = z
+  .object({
+    subjectType: z.enum(['consignment', 'job']),
+    subjectRefId: z.string().length(24),
+  })
+  .strict();
+messageThreadsRouter.post(
+  '/open',
+  rateLimit('write'),
+  authenticate,
+  requirePermission('message:participate'),
+  validate({ body: OpenSubjectBody }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const { subjectType, subjectRefId } = body<z.infer<typeof OpenSubjectBody>>(req);
+    created(res, await messagingService.openForSubject(principal(req), subjectType, subjectRefId));
+  }),
+);
+
 messageThreadsRouter.get(
   '/mine',
   rateLimit('read'),

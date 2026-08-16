@@ -13,9 +13,27 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
  * seconds between scanning and submitting.
  */
 
-/** Token lifetime. Short enough that a leaked photo is near-worthless, long enough to scan. */
-export const QR_WINDOW_SECONDS = 30;
-/** Windows either side accepted — covers clock skew and slow submissions (±30s). */
+/**
+ * Token lifetime.
+ *
+ * **Set to 1 hour at the product owner's request (was 30s).** Recorded plainly because it is a
+ * deliberate trade against the control this file exists to provide: with `SKEW_WINDOWS = 1` a
+ * photographed code now works for up to two hours rather than a minute, so proof of physical
+ * presence becomes proof of having been near the hub at some point today. Anyone who photographs
+ * the station screen can reserve stock remotely for the rest of the window.
+ *
+ * That is a defensible call for a trusted-hub pilot where sellers were failing to scan in time, and
+ * a bad one at scale. It is one number, so shortening it later is a config change rather than a
+ * redesign.
+ */
+export const QR_WINDOW_SECONDS = 3600;
+/**
+ * Windows either side accepted — covers clock skew and slow submissions.
+ *
+ * At a 1-hour window this is the difference between a worst case of 1 hour and 2 hours of validity,
+ * so it matters more than it did at 30 seconds. Kept at 1 because a hub tablet with a drifting
+ * clock would otherwise reject every scan, which is a worse failure than a longer window.
+ */
 const SKEW_WINDOWS = 1;
 
 const TOKEN_PREFIX = 'ssq1'; // versioned, so the format can change without ambiguity

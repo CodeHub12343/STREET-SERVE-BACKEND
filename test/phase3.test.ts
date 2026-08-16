@@ -278,6 +278,27 @@ describe('direct order flow + away interlock + partial fulfilment', () => {
     expect(order.body.data.totalCents).toBe(1300); // 2*300 + 700
     const orderId = order.body.data.id as string;
 
+    /**
+     * Settle the card. Placing an order only OPENS the charge now — the vendor is not told and the
+     * order does not enter their queue until the money arrives — so a test that wants a LIVE order
+     * has to pay for it, exactly as a customer completing the payment screen would.
+     */
+    const placedOrder = await (
+      await import('../src/modules/orders/orders.model')
+    ).OrderModel.findById(orderId).lean();
+    const orderTxn = await TransactionModel.findById(placedOrder!.transaction_id).lean();
+    await request(app)
+      .post('/webhooks/stripe')
+      .set('stripe-signature', 'test')
+      .set('content-type', 'application/json')
+      .send(
+        JSON.stringify({
+          id: `evt_${Math.random()}`,
+          type: 'payment_intent.succeeded',
+          data: { object: { id: orderTxn!.payment_intent_ref } },
+        }),
+      );
+
     const accept = await request(app)
       .post(`/api/v1/orders/${orderId}/accept`)
       .set(...bearer(token));
@@ -928,5 +949,130 @@ describe('vendor dashboard read model', () => {
       .get(`/api/v1/businesses/${businessId}/dashboard`)
       .set(...bearer(other));
     expect(denied.status).toBe(403);
+  });
+});
+
+/**
+ * ═══ A CONVERSATION IS ABOUT A PIECE OF WORK. ═══
+ *
+ * Messaging was hardcoded customer↔business — two id fields and a unique index on the pair — so the
+ * only relationship the product could carry a conversation for was a customer talking to a shop. A
+ * hub and the street seller holding its stock had no channel at all, and neither did the two sides
+ * of a job, even though both are working relationships with money and deadlines in them.
+ *
+ * The subject is also the access rule: membership is read off the checkout or the application, so
+ * there is no way to name your own counterparty into a thread.
+ */
+describe('messaging about consignment and jobs', () => {
+  /**
+   * Built straight from the models. These tests are about who may talk about a piece of work, not
+   * about how a checkout comes into being — driving the whole QR reservation flow would test the
+   * consignment module a third time and make the failure message useless when it breaks.
+   */
+  async function consignmentPair(prefix: string) {
+    const { HubModel, InventoryCheckoutModel } = await import(
+      '../src/modules/consignment/consignment.model'
+    );
+    const hubOwnerId = await seedUser({
+      authProviderId: `${prefix}|hubowner`,
+      roles: ['hub'],
+    });
+    const sellerId = await seedUser({ authProviderId: `${prefix}|seller`, roles: ['seller'] });
+
+    const hub = await HubModel.create({
+      business_id: `biz_${prefix}`,
+      owner_user_id: hubOwnerId,
+      checkout_qr_secret: 'x'.repeat(32),
+    });
+    const checkout = await InventoryCheckoutModel.create({
+      seller_id: sellerId,
+      product_id: `prod_${prefix}`,
+      hub_id: String(hub._id),
+      quantity: 3,
+      unit_value_cents: 1000,
+      consignment_split_percent: 70,
+      condition_photo_url: 'https://cdn.test/c.jpg',
+      seller_agreement_version: 'v1',
+      status: 'active',
+      expected_return_at: new Date(Date.now() + 7 * 86_400_000),
+    });
+
+    return {
+      hubToken: await mintToken(`${prefix}|hubowner`),
+      sellerToken: await mintToken(`${prefix}|seller`),
+      checkoutId: String(checkout._id),
+    };
+  }
+
+  it('opens one thread per checkout, for the seller and the hub owner only', async () => {
+    const { hubToken, sellerToken, checkoutId } = await consignmentPair('msg-cons');
+
+    const opened = await request(app)
+      .post('/api/v1/message-threads/open')
+      .set(...bearer(sellerToken))
+      .send({ subjectType: 'consignment', subjectRefId: checkoutId });
+    expect(opened.status).toBe(201);
+    const threadId = opened.body.data.id as string;
+
+    // Idempotent: the hub owner tapping "Message" lands in the SAME conversation, not a second one.
+    const fromHub = await request(app)
+      .post('/api/v1/message-threads/open')
+      .set(...bearer(hubToken))
+      .send({ subjectType: 'consignment', subjectRefId: checkoutId });
+    expect(fromHub.status).toBe(201);
+    expect(fromHub.body.data.id).toBe(threadId);
+
+    // Both can talk.
+    await request(app)
+      .post(`/api/v1/message-threads/${threadId}/messages`)
+      .set(...bearer(sellerToken))
+      .send({ body: 'Two boxes left, collecting Friday?' })
+      .expect(201);
+    await request(app)
+      .post(`/api/v1/message-threads/${threadId}/messages`)
+      .set(...bearer(hubToken))
+      .send({ body: 'Friday works.' })
+      .expect(201);
+
+    // And it lands in the SAME inbox as everything else — one list, one unread count.
+    const inbox = await request(app)
+      .get('/api/v1/message-threads/mine')
+      .set(...bearer(hubToken));
+    expect(inbox.status).toBe(200);
+    const row = (inbox.body.data as { id: string; subjectType: string }[]).find(
+      (t) => t.id === threadId,
+    );
+    expect(row).toBeTruthy();
+    expect(row!.subjectType).toBe('consignment');
+  });
+
+  /** The property that makes this safe to expose: you cannot talk your way into someone's work. */
+  it('refuses a stranger who is neither the seller nor the hub owner', async () => {
+    const { checkoutId } = await consignmentPair('msg-stranger');
+
+    await seedUser({ authProviderId: 'msg-stranger|nosy', roles: ['customer'] });
+    const nosy = await mintToken('msg-stranger|nosy');
+
+    const res = await request(app)
+      .post('/api/v1/message-threads/open')
+      .set(...bearer(nosy))
+      .send({ subjectType: 'consignment', subjectRefId: checkoutId });
+    expect([403, 404]).toContain(res.status);
+  });
+
+  it('will not open a thread against work that does not exist', async () => {
+    const { hubToken } = await consignmentPair('msg-ghost');
+    const res = await request(app)
+      .post('/api/v1/message-threads/open')
+      .set(...bearer(hubToken))
+      .send({ subjectType: 'consignment', subjectRefId: '0'.repeat(24) });
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses an unauthenticated caller', async () => {
+    const res = await request(app)
+      .post('/api/v1/message-threads/open')
+      .send({ subjectType: 'consignment', subjectRefId: '0'.repeat(24) });
+    expect(res.status).toBe(401);
   });
 });

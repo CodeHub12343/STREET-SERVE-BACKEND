@@ -18,27 +18,50 @@ interface ThreadParticipants {
   customerId: string;
   businessId: string;
   businessOwnerId: string | null;
+  /** Everyone allowed in, whichever kind of thread this is. */
+  memberIds: string[];
 }
 
+/**
+ * Membership, for either kind of thread.
+ *
+ * A `business` thread derives it the way it always did — the customer, plus whoever owns the
+ * business, resolved live so a change of owner does not lock the new one out. A subject thread
+ * (consignment, job) carries its members on the row, fixed when it opened.
+ */
 async function loadParticipants(threadId: string): Promise<{
   thread: ThreadParticipants;
-  raw: { _id: unknown; customer_id: string; business_id: string };
+  raw: { _id: unknown; customer_id: string | null; business_id: string | null };
 }> {
   const thread = await MessageThreadModel.findById(threadId).lean().exec();
   if (!thread) throw NotFoundError('Thread not found');
-  const owner = await vendorsService.getBusinessOwner(thread.business_id);
+
+  const owner = thread.business_id
+    ? await vendorsService.getBusinessOwner(thread.business_id)
+    : null;
+  const memberIds = thread.business_id
+    ? [thread.customer_id, owner].filter((x): x is string => Boolean(x))
+    : (thread.participant_user_ids ?? []);
+
   return {
-    raw: { _id: thread._id, customer_id: thread.customer_id, business_id: thread.business_id },
+    raw: {
+      _id: thread._id,
+      customer_id: thread.customer_id ?? null,
+      business_id: thread.business_id ?? null,
+    },
     thread: {
-      customerId: thread.customer_id,
-      businessId: thread.business_id,
+      customerId: thread.customer_id ?? '',
+      businessId: thread.business_id ?? '',
       businessOwnerId: owner,
+      memberIds,
     },
   };
 }
 
 function isParticipant(principal: Principal, p: ThreadParticipants): boolean {
-  return principal.userId === p.customerId || principal.userId === p.businessOwnerId;
+  // One list, so a consignment or job thread is authorised by exactly the same check as a
+  // customer↔business one — the whole point of generalising rather than forking.
+  return p.memberIds.includes(principal.userId);
 }
 
 interface BusinessBrief {
@@ -79,12 +102,107 @@ async function userBriefFor(ids: string[]): Promise<Map<string, UserBrief>> {
   );
 }
 
+/**
+ * Who may talk about a consignment checkout: the seller holding the stock, and the person who owns
+ * the hub it came from. Read from the checkout rather than passed in, so a caller cannot name
+ * themselves into someone else's conversation.
+ */
+async function participantsForCheckout(
+  checkoutId: string,
+): Promise<{ userIds: string[]; title: string } | null> {
+  const { InventoryCheckoutModel, HubModel } = await import('../consignment/consignment.model');
+  const checkout = await InventoryCheckoutModel.findById(checkoutId).lean().exec();
+  if (!checkout) return null;
+  const hub = await HubModel.findById(checkout.hub_id).lean().exec();
+  if (!hub?.owner_user_id) return null;
+
+  return {
+    // Deduped: a hub owner selling their own stock is one person, not two participants.
+    userIds: [...new Set([checkout.seller_id, hub.owner_user_id])],
+    title: 'Consignment',
+  };
+}
+
+/**
+ * Who may talk about a job: the person who posted it and the person doing it.
+ *
+ * Keyed on the APPLICATION rather than the posting, because a posting can have many applicants and
+ * one shared thread across all of them would leak every applicant to every other. An `applied` row
+ * counts — questions before accepting are exactly when a worker needs to ask them — but the
+ * conversation is still one-to-one.
+ */
+async function participantsForEngagement(
+  applicationId: string,
+): Promise<{ userIds: string[]; title: string } | null> {
+  const { JobApplicationModel, JobPostingModel } = await import('../jobs/jobs.model');
+  const application = await JobApplicationModel.findById(applicationId).lean().exec();
+  if (!application) return null;
+  const posting = await JobPostingModel.findById(application.job_id).lean().exec();
+  if (!posting) return null;
+
+  return {
+    userIds: [...new Set([posting.poster_user_id, application.applicant_id])],
+    title: posting.title ?? 'Job',
+  };
+}
+
 export const messagingService = {
   /**
    * Start (or reopen) the scoped thread between a customer and a business. Without `customerId`
    * the caller IS the customer. With it, the caller must own the business — this is how a vendor
    * opens the conversation with a customer who booked/ordered, instead of waiting to be messaged.
    */
+  /**
+   * ═══ Open the thread for a piece of work. ═══
+   *
+   * The subject is also the access rule. `startThread` refuses to open a customer↔business thread
+   * without a live booking or order, because messaging is where two parties settle a job they are
+   * actually doing rather than an open inbox any stranger can start. A consignment checkout and a
+   * job engagement are that same proof, so membership is read from the record itself: whoever is on
+   * it can talk, and nobody else can — there is no "invite" and no way to name your own
+   * counterparty.
+   *
+   * Idempotent by construction. The thread is keyed on the subject, so both sides tapping "Message"
+   * at the same moment land in the same conversation instead of creating two.
+   */
+  async openForSubject(
+    principal: Principal,
+    subjectType: 'consignment' | 'job',
+    subjectRefId: string,
+  ) {
+    const participants =
+      subjectType === 'consignment'
+        ? await participantsForCheckout(subjectRefId)
+        : await participantsForEngagement(subjectRefId);
+
+    if (!participants) throw NotFoundError('That work no longer exists');
+    if (!participants.userIds.includes(principal.userId)) {
+      throw ForbiddenError(
+        'Only the two people working on this can message about it',
+        ERROR_CODES.NOT_PARTICIPANT,
+      );
+    }
+
+    const thread = await MessageThreadModel.findOneAndUpdate(
+      { subject_type: subjectType, subject_ref_id: subjectRefId },
+      {
+        $setOnInsert: {
+          subject_type: subjectType,
+          subject_ref_id: subjectRefId,
+          participant_user_ids: participants.userIds,
+        },
+      },
+      { upsert: true, new: true },
+    ).exec();
+
+    return {
+      id: String(thread._id),
+      subjectType,
+      subjectRefId,
+      title: participants.title,
+    };
+  },
+
   async startThread(principal: Principal, businessId: string, customerId?: string) {
     const owner = await vendorsService.getBusinessOwner(businessId);
     if (!owner) throw NotFoundError('Business not found');
@@ -181,8 +299,18 @@ export const messagingService = {
   async listThreads(principal: Principal) {
     const ownedBusinesses = await vendorsRepository.listBusinessesByOwner(principal.userId);
     const businessIds = ownedBusinesses.map((b) => String(b._id));
+    /**
+     * ONE inbox, whatever the thread is about. The third clause picks up consignment and job
+     * threads, which carry their members on the row rather than deriving them from a business —
+     * so a hub owner, a street seller and a gig worker all read from the same list, with the same
+     * unread count and the same socket.
+     */
     const threads = await MessageThreadModel.find({
-      $or: [{ customer_id: principal.userId }, { business_id: { $in: businessIds } }],
+      $or: [
+        { customer_id: principal.userId },
+        { business_id: { $in: businessIds } },
+        { participant_user_ids: principal.userId },
+      ],
     })
       .sort({ last_message_at: -1 })
       .lean()
@@ -191,10 +319,10 @@ export const messagingService = {
 
     const threadIds = threads.map((t) => t._id);
     const [info, users, stats] = await Promise.all([
-      businessInfoFor(threads.map((t) => t.business_id)),
+      businessInfoFor(threads.map((t) => t.business_id).filter((x): x is string => Boolean(x))),
       // Only threads where I'm the business need the customer's identity, but batching every
       // customer_id costs one read and keeps the mapping branch-free.
-      userBriefFor(threads.map((t) => t.customer_id)),
+      userBriefFor(threads.map((t) => t.customer_id).filter((x): x is string => Boolean(x))),
       // Newest body + unread-for-me count, per thread, in one pass.
       MessageModel.aggregate<{ _id: unknown; lastBody: string; lastAt: Date; unread: number }>([
         { $match: { thread_id: { $in: threadIds } } },
@@ -227,7 +355,29 @@ export const messagingService = {
     // The counterparty is whoever ISN'T me: the business (when I'm the customer) or the customer
     // (when I own the business). Resolving it here is what stops the vendor from seeing their own
     // business name at the top of every thread. Presence is looked up for those counterparty users.
+    /**
+     * A subject thread has no business and no customer — just the other member. Resolved the same
+     * way regardless: the counterparty is whoever is not me, which is what stops anyone seeing
+     * their own name at the top of every thread.
+     */
+    const otherMemberIds = threads
+      .filter((t) => !t.business_id)
+      .map((t) => (t.participant_user_ids ?? []).find((id) => id !== principal.userId))
+      .filter((id): id is string => Boolean(id));
+    const otherMembers = await userBriefFor(otherMemberIds);
+
     const rows = threads.map((t) => {
+      if (!t.business_id) {
+        const otherId = (t.participant_user_ids ?? []).find((id) => id !== principal.userId) ?? null;
+        const u = otherId ? otherMembers.get(otherId) : undefined;
+        return {
+          t,
+          side: 'business' as const,
+          // Labelled by what the conversation is ABOUT, since there is no business behind it.
+          businessName: t.subject_type === 'consignment' ? 'Consignment' : 'Job',
+          cp: { name: u?.name ?? 'Member', avatarUrl: u?.photoUrl ?? null, userId: otherId },
+        };
+      }
       const side: 'customer' | 'business' = t.customer_id === principal.userId ? 'customer' : 'business';
       const biz = info.get(t.business_id);
       const businessName = biz?.name ?? 'Business';
@@ -235,8 +385,8 @@ export const messagingService = {
         side === 'customer'
           ? { name: businessName, avatarUrl: biz?.logoUrl ?? null, userId: biz?.ownerId ?? null }
           : (() => {
-              const u = users.get(t.customer_id);
-              return { name: u?.name ?? 'Customer', avatarUrl: u?.photoUrl ?? null, userId: t.customer_id };
+              const u = users.get(t.customer_id ?? '');
+              return { name: u?.name ?? 'Customer', avatarUrl: u?.photoUrl ?? null, userId: t.customer_id ?? null };
             })();
       return { t, side, businessName, cp };
     });
@@ -248,8 +398,11 @@ export const messagingService = {
       const p = cp.userId ? pres.get(cp.userId) : undefined;
       return {
         id: String(t._id),
-        customerId: t.customer_id,
-        businessId: t.business_id,
+        customerId: t.customer_id ?? null,
+        businessId: t.business_id ?? null,
+        /** What this conversation is about, so the client can route and label it. */
+        subjectType: t.subject_type ?? 'business',
+        subjectRefId: t.subject_ref_id ?? null,
         businessName,
         // Who the reader is actually talking to (name + avatar), plus their id for presence.
         counterpartyName: cp.name,
