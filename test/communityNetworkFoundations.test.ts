@@ -217,6 +217,15 @@ describe('2.1 · the community fund is a custodial liability (ADR-005)', () => {
       'expire',
       'redeem',
       'refund',
+      /**
+       * The exact inverse of `redeem`, for an order that was cancelled after the fund had covered
+       * it. Reviewed against the rule this test exists to enforce, and it holds: nothing leaves.
+       * The community is CREDITED back its liability, the seller is debited for a meal they did not
+       * serve, and the platform gives back the fee on a sale that did not happen. Money moves
+       * towards the pool, never out of it — which is why this is a legitimate addition to a surface
+       * that is otherwise deliberately closed.
+       */
+      'reverseRedemption',
       // Phase 4 — moves held money between two funds of the SAME business (roll-forward). Still not
       // a way out to anybody: both legs are `community_fund_payable`, so the liability changes hands
       // rather than being discharged, and a cross-business move is rejected.

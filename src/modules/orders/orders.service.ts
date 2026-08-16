@@ -511,6 +511,21 @@ export const ordersService = {
         // Not yet captured/settled — the pending PaymentIntent will not be completed; safe to ignore.
       }
     }
+
+    /**
+     * PIF-4 — and give the community its money back.
+     *
+     * Cancelling refunded the customer's card and stopped there, so the community's share of a
+     * cancelled order evaporated: the pool had been debited, the contributions consumed and the
+     * ledger posted, and then the meal never happened. On a fully covered order the customer's own
+     * refund is $0, so nothing on any screen showed the loss at all — the pool just quietly got
+     * smaller. Reversed here rather than inside the refund block above, because a fully covered
+     * order has no `transaction_id` to refund and is exactly the case that loses the most.
+     */
+    if ((order.pay_it_forward_cents ?? 0) > 0) {
+      await payforwardService.refundRedemptionForOrder(orderId);
+    }
+
     const notifyUser = isCustomer ? owner : order.customer_id;
     if (notifyUser)
       this.notifyCustomer(notifyUser, orderId, 'cancelled', reason ?? 'Order cancelled');

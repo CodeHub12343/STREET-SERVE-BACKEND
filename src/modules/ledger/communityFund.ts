@@ -227,6 +227,79 @@ export const communityFundLedger = {
   },
 
   /**
+   * The order was cancelled, so the redemption did not happen. The exact inverse of `redeem`.
+   *
+   * Distinct from `refund` below, and the distinction is the whole reason this exists: `refund`
+   * sends money OUT to a contributor and credits platform cash. Nothing leaves here. The meal was
+   * never served, so the liability to the community comes back, the seller stops being owed for it,
+   * and the platform gives back the fee it took on a sale that did not happen. Posting a cancelled
+   * order through `refund` would have shown the community's money leaving the platform when it had
+   * simply gone back on the shelf.
+   *
+   * Idempotent on the redemption id, like every other entry point here.
+   */
+  async reverseRedemption(input: {
+    fund: FundRef;
+    amountCents: number;
+    /** The fee that was actually taken at `redeem` time — given back, never recomputed. */
+    feeCents: number;
+    /** Redemption row id — the idempotency key. */
+    redemptionId: string;
+    memo?: string;
+  }) {
+    assertPositive(input.amountCents);
+    if (!Number.isInteger(input.feeCents) || input.feeCents < 0) {
+      throw ValidationError('Community fund fee must be a non-negative integer');
+    }
+    if (input.feeCents > input.amountCents) {
+      throw ValidationError('Community fund fee cannot exceed the redeemed amount');
+    }
+    const sellerNet = input.amountCents - input.feeCents;
+
+    return ledgerService.post({
+      transactionId: `cfund_redeem_reverse_${input.redemptionId}`,
+      refType: 'community_redemption',
+      refId: input.redemptionId,
+      memo: input.memo,
+      entries: [
+        {
+          ownerType: 'business',
+          ownerId: ownerOf(input.fund),
+          accountType: 'community_fund_payable',
+          // Credit, where `redeem` debited: the community is owed this money again.
+          direction: 'credit',
+          amountCents: input.amountCents,
+          entryType: 'community_redemption',
+        },
+        ...(sellerNet > 0
+          ? ([
+              {
+                ownerType: 'business' as const,
+                ownerId: input.fund.businessId,
+                accountType: 'payable' as const,
+                direction: 'debit' as const,
+                amountCents: sellerNet,
+                entryType: 'community_redemption' as const,
+              },
+            ] as const)
+          : []),
+        ...(input.feeCents > 0
+          ? ([
+              {
+                ownerType: 'platform' as const,
+                ownerId: null,
+                accountType: 'fee_revenue' as const,
+                direction: 'debit' as const,
+                amountCents: input.feeCents,
+                entryType: 'community_redemption' as const,
+              },
+            ] as const)
+          : []),
+      ],
+    });
+  },
+
+  /**
    * Money returned to the contributor: the 24-hour change-of-mind window (ADR-005 §7), or every
    * contributor of a Boost campaign that missed its goal (ADR-006 §3).
    *

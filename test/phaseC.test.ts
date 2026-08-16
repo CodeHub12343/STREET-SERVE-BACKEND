@@ -6,6 +6,8 @@ import { SELLER_AGREEMENT_VERSION } from '../src/config/constants';
 import { setStripeGateway } from '../src/integrations/stripe';
 import { CategoryModel } from '../src/modules/catalog/catalog.model';
 import { HubModel } from '../src/modules/consignment/consignment.model';
+import { UserModel } from '../src/modules/identity/identity.model';
+import { LiveSessionModel } from '../src/modules/livemap/livemap.model';
 import { ConnectedAccountModel } from '../src/modules/payments/payments.model';
 import { bearer, mintToken, seedUser } from './helpers';
 import { FakeStripeGateway } from './fakes';
@@ -383,6 +385,116 @@ describe('C-5: a hub owner can see where their stock is', () => {
     const live = res.body.data.holders.find((h: { lngLat: unknown }) => h.lngLat !== null);
     expect(live.lngLat).toHaveLength(2);
     expect(live.lastSeenAt).toBeTruthy();
+  });
+
+  /**
+   * ═══ A seller who has gone home is not a seller we cannot find. ═══
+   *
+   * The query filtered on `ended_at: null`, so the only holders with a position were those live at
+   * the instant the screen was opened. Between shifts — most of the day — every row came back
+   * unlocatable and the map rendered empty, while the last known position of each seller sat in the
+   * database being ignored. A hub owner chasing stock was told nothing when we could have told them
+   * where it was last seen.
+   *
+   * The stale fix is returned and clearly LABELLED as stale, because a last-known position drawn as
+   * a current one would be worse than none: it would send someone to the wrong place.
+   */
+  it('falls back to the last known position when a seller has gone offline', async () => {
+    const hub = await makeHub('c5stale', { products: [{ qty: 10, unitValue: 1000 }] });
+
+    await seedUser({ authProviderId: 'c5stale|gone', roles: ['seller'], tier: 'gold' });
+    const token = await mintToken('c5stale|gone');
+    await request(app)
+      .post('/api/v1/seller-agreement/accept')
+      .set(...bearer(token))
+      .send({ version: SELLER_AGREEMENT_VERSION });
+    const me = await request(app).get('/api/v1/users/me').set(...bearer(token));
+    const sellerId = me.body.data.id as string;
+
+    await request(app)
+      .post('/api/v1/live-sessions/start')
+      .set(...bearer(token))
+      .send({
+        actorType: 'seller',
+        actorId: sellerId,
+        lng: ORIGIN.lng + 0.02,
+        lat: ORIGIN.lat + 0.02,
+        status: 'parked',
+      });
+    await request(app)
+      .post('/api/v1/checkouts')
+      .set(...bearer(token))
+      .send({
+        productId: hub.productIds[0],
+        quantity: 2,
+        conditionPhotoUrl: 'https://cdn.test/c.jpg',
+        qrToken: hub.qrToken,
+      })
+      .expect(201);
+
+    // They finish their shift. The session ends; the position it recorded does not evaporate.
+    await LiveSessionModel.updateOne(
+      { actor_type: 'seller', actor_id: sellerId },
+      { $set: { ended_at: new Date() } },
+    );
+
+    const res = await request(app)
+      .get(`/api/v1/hubs/${hub.hubId}/inventory-map`)
+      .set(...bearer(hub.hubToken));
+    expect(res.status).toBe(200);
+
+    const holder = res.body.data.holders[0];
+    // On the map — not thrown away…
+    expect(holder.lngLat).toHaveLength(2);
+    expect(res.body.data.locatedCount).toBe(1);
+    // …but never presented as a live position.
+    expect(holder.locationAge).toBe('last_known');
+    expect(holder.liveStatus).toBeNull();
+    expect(res.body.data.liveCount).toBe(0);
+    expect(holder.lastSeenAt).toBeTruthy();
+  });
+
+  /**
+   * Two rows both reading "Seller" is the failure of the entire screen: the hub owner cannot tell
+   * which of two people holds which stock. `display_name` is nullable and only ever populated from
+   * the auth provider, so the bare fallback hit anyone who signed up without one.
+   */
+  it('never renders two different sellers under the same fallback name', async () => {
+    const hub = await makeHub('c5name', { products: [{ qty: 20, unitValue: 500 }] });
+
+    for (const n of ['one', 'two']) {
+      await seedUser({ authProviderId: `c5name|${n}`, roles: ['seller'], tier: 'gold' });
+      const token = await mintToken(`c5name|${n}`);
+      await request(app)
+        .post('/api/v1/seller-agreement/accept')
+        .set(...bearer(token))
+        .send({ version: SELLER_AGREEMENT_VERSION });
+      const me = await request(app).get('/api/v1/users/me').set(...bearer(token));
+      // No display_name at all — the exact state that produced two identical rows.
+      await UserModel.updateOne(
+        { _id: me.body.data.id },
+        { $set: { display_name: null, email: null, phone: null } },
+      );
+      await request(app)
+        .post('/api/v1/checkouts')
+        .set(...bearer(token))
+        .send({
+          productId: hub.productIds[0],
+          quantity: 2,
+          conditionPhotoUrl: 'https://cdn.test/c.jpg',
+          qrToken: hub.qrToken,
+        })
+        .expect(201);
+    }
+
+    const res = await request(app)
+      .get(`/api/v1/hubs/${hub.hubId}/inventory-map`)
+      .set(...bearer(hub.hubToken));
+    expect(res.status).toBe(200);
+
+    const names = res.body.data.holders.map((h: { sellerName: string }) => h.sellerName);
+    expect(names).toHaveLength(2);
+    expect(new Set(names).size).toBe(2); // distinguishable, which "Seller" twice was not
   });
 
   it('refuses a non-owner — it discloses specific sellers’ live positions', async () => {

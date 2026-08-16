@@ -8,7 +8,12 @@ import { requirePermission } from '../../middleware/rbac';
 import { requireModule } from '../../middleware/requireModule';
 import { validate } from '../../middleware/validate';
 import { payforwardController } from './payforward.controller';
-import { BusinessIdParam, ContributeBody, FundSettingsBody } from './payforward.schema';
+import {
+  BusinessIdParam,
+  ContributeBody,
+  ContributionIdParam,
+  FundSettingsBody,
+} from './payforward.schema';
 
 /**
  * Pay It Forward (ADR-005). Mounted at `/pay-it-forward`.
@@ -18,6 +23,35 @@ import { BusinessIdParam, ContributeBody, FundSettingsBody } from './payforward.
  * gave (unless they asked to be named) or who received (never).
  */
 export const payforwardRouter = Router();
+
+/**
+ * The caller's own gifts. **Declared before `/:businessId`**, which would otherwise match `mine` as
+ * a business id and hand back a fund for a business that does not exist.
+ *
+ * Authenticated and self-scoped — it is the only view in this module that shows a contribution
+ * which did not settle, and the only one that could ever tie a gift to the person who gave it.
+ */
+payforwardRouter.get(
+  '/contributions/mine',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('payforward:contribute'),
+  asyncHandler(payforwardController.mine),
+);
+
+/**
+ * ADR-005 §7 — the change-of-mind window. Money-path, so idempotency-keyed: a double tap must not
+ * attempt two refunds against the same gift.
+ */
+payforwardRouter.post(
+  '/contributions/:contributionId/refund',
+  rateLimit('money'),
+  authenticate,
+  requirePermission('payforward:contribute'),
+  idempotency,
+  validate({ params: ContributionIdParam }),
+  asyncHandler(payforwardController.refundContribution),
+);
 
 payforwardRouter.get(
   '/:businessId',

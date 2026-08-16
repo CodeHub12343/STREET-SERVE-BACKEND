@@ -5,11 +5,13 @@ import {
   DEFAULT_CONSIGNMENT_FEE_BPS,
   RTO_PRE_RECOVERY_DAYS,
   RTO_PROHIBITED_CATEGORY_SLUGS,
+  RTO_RECONCILE_AFTER_MS,
   RTO_REMINDER_LEAD_DAYS,
   type RtoReminderStage,
 } from '../../config/constants';
 import { env, isProd } from '../../config/env';
 import { logger } from '../../config/logger';
+import { stripe } from '../../integrations/stripe';
 import { publish } from '../../events/bus';
 import { writeAudit } from '../../shared/audit';
 import { formatCents } from '../../shared/money';
@@ -849,7 +851,16 @@ export const rtoService = {
        * account of the condition into an agreed fact.
        */
       condition_delivery: conditionReportToDoc(input.condition ?? {}, { customerAck: true }),
-      ownership_credited_cents: quote.initialOwnershipCreditCents,
+      /**
+       * **Zero, until a card has actually been confirmed.**
+       *
+       * This was seeded with the initial payment's ownership credit at the moment the agreement was
+       * written — before any money moved, and in practice before any money EVER moved, because the
+       * charge below only opened a PaymentIntent. A customer could accept and immediately own 20% of
+       * a laptop they had not paid a cent for. Ownership is credited in `creditByPaymentIntent`,
+       * off the `payment_intent.succeeded` webhook, and nowhere else.
+       */
+      ownership_credited_cents: 0,
       installments_paid: 0,
       next_due_at: quote.schedule[0] ? new Date(now + quote.schedule[0].dueOffsetDays * 86_400_000) : null,
       status: 'active',
@@ -878,49 +889,78 @@ export const rtoService = {
       })),
     );
 
-    // Charge the initial payment (fee applies per payment) + optional setup fee; append to ledger.
-    if (quote.initialPaymentCents > 0) {
+    /**
+     * ═══ OPEN the charge for everything due today. Do not pretend it settled. ═══
+     *
+     * **One intent, not two.** The initial payment and the set-up fee were charged as separate
+     * PaymentIntents, which was survivable only while nothing collected a card: the moment a real
+     * customer is asked to confirm, two intents means two card forms for one "accept" — and a
+     * customer who confirms the first and abandons the second leaves an agreement that is half paid
+     * for, with no screen that can finish it. They are one payment because they are one decision.
+     *
+     * The set-up fee rides in `serviceFeeCents` so it is excluded from the RTO fee base. That
+     * reproduces the previous economics exactly — `setup` carries no platform rate, and the
+     * `rto_installment` fee applied to the initial payment alone — while charging a fee on a fee is
+     * avoided by the same rule that governs every other customer-paid fee component (R8/R10).
+     *
+     * Nothing is written to the ledger here and no ownership is credited. The ledger is the money
+     * record; appending to it for money that is still sitting behind an unconfirmed card is how the
+     * books came to disagree with Stripe in the first place.
+     */
+    const dueNowCents = quote.initialPaymentCents + quote.setupFeeCents;
+    let clientSecret: string | null = null;
+    let paymentIntentRef: string | null = null;
+    if (dueNowCents > 0) {
       const charge = await paymentsService.charge({
         customerId: principal.userId,
         counterpartyType: 'business',
         counterpartyId: sellerId,
-        amountCents: quote.initialPaymentCents,
+        amountCents: dueNowCents,
+        ...(quote.setupFeeCents > 0 ? { serviceFeeCents: quote.setupFeeCents } : {}),
         feeType: 'rto_installment',
-        idempotencyKey: `${idempotencyKey}_initial`,
+        idempotencyKey: `${idempotencyKey}_acceptance`,
+        /**
+         * ═══ Keep the card. This is the only moment we can. ═══
+         *
+         * An agreement is twelve scheduled payments, and every one of them falls due when nobody is
+         * looking at a screen. Acceptance is the single point where the customer is present and
+         * entering a card, so if it is not saved here the instalment sweep has nothing to charge
+         * and the whole schedule is decorative.
+         *
+         * The acceptance screen discloses this before they pay.
+         */
+        savePaymentMethod: true,
+        ...(principal.email ? { customerEmail: principal.email } : {}),
       });
-      await repo.appendLedger({
-        agreement_id: agreementId,
-        entry_type: 'initial',
-        installment_number: null,
-        amount_cents: quote.initialPaymentCents,
-        fee_cents: charge.platformFeeCents ?? 0,
-        ownership_credit_cents: quote.initialOwnershipCreditCents,
-        transaction_id: charge.transactionId,
-        idempotency_key: `rto_initial_${agreementId}`,
+      clientSecret = charge.clientSecret ?? null;
+      paymentIntentRef = charge.paymentIntentRef ?? null;
+      await repo.updateAgreement(agreementId, {
+        pending_intent_ref: paymentIntentRef,
+        pending_intent_kind: 'acceptance',
       });
-      await paymentsService.completeForOrder(charge.transactionId); // capture-at-acceptance
-      await this.recordSplit(agreement, null, 'initial', quote.initialPaymentCents);
-    }
-    if (quote.setupFeeCents > 0) {
-      const setup = await paymentsService.charge({
-        customerId: principal.userId,
-        counterpartyType: 'business',
-        counterpartyId: sellerId,
-        amountCents: quote.setupFeeCents,
-        feeType: 'setup',
-        idempotencyKey: `${idempotencyKey}_setup`,
+      agreement.pending_intent_ref = paymentIntentRef;
+      agreement.pending_intent_kind = 'acceptance';
+    } else {
+      /**
+       * Nothing due today, but the schedule still needs a card.
+       *
+       * An agreement with no deposit and no set-up fee has no charge to attach the stored
+       * credential to — and without one, every instalment after it is uncollectable. Stripe will
+       * not create a zero-amount PaymentIntent, so a SetupIntent asks for the card at the one
+       * moment the customer is present, taking nothing.
+       */
+      const setup = await stripe().createSetupIntent({
+        customerRef: principal.userId,
+        metadata: { kind: 'rto_card_setup', agreementId },
+        idempotencyKey: `${idempotencyKey}_setup_intent`,
       });
-      await repo.appendLedger({
-        agreement_id: agreementId,
-        entry_type: 'setup_fee',
-        installment_number: null,
-        amount_cents: quote.setupFeeCents,
-        fee_cents: setup.platformFeeCents ?? 0,
-        ownership_credit_cents: 0,
-        transaction_id: setup.transactionId,
-        idempotency_key: `rto_setup_${agreementId}`,
+      clientSecret = setup.clientSecret;
+      await repo.updateAgreement(agreementId, {
+        pending_intent_ref: setup.setupIntentId,
+        pending_intent_kind: 'card_setup',
       });
-      await paymentsService.completeForOrder(setup.transactionId);
+      agreement.pending_intent_ref = setup.setupIntentId;
+      agreement.pending_intent_kind = 'card_setup';
     }
 
     await writeAudit({
@@ -928,10 +968,21 @@ export const rtoService = {
       action: 'rto.agreement_accepted',
       entityType: 'rto_agreement',
       entityId: agreementId,
-      metadata: { sellerId: sellerId, totalToOwnCents: quote.totalToOwnCents },
+      metadata: { sellerId: sellerId, totalToOwnCents: quote.totalToOwnCents, dueNowCents },
     });
     await publish('rto.agreement_accepted', { agreementId, customerId: principal.userId });
-    return this.dashboardFrom(agreement, quote);
+    return {
+      ...this.dashboardFrom(agreement, quote),
+      /**
+       * The client secret the acceptance screen needs to actually collect the card. Null only when
+       * there is genuinely nothing to pay today (no initial payment, no set-up fee) — the screen
+       * distinguishes the two, because "no card needed" and "we could not start your payment" look
+       * identical to a customer and only one of them is fine.
+       */
+      clientSecret,
+      paymentIntentRef,
+      amountDueNowCents: dueNowCents,
+    };
   },
 
   /**
@@ -961,7 +1012,33 @@ export const rtoService = {
       ) {
         continue;
       }
+      /**
+       * The deposit has not cleared yet. Billing instalment #1 against a customer whose very first
+       * payment is still unconfirmed would charge them for an agreement they have not actually
+       * entered — and a decline here would put them straight into Grace for a schedule that never
+       * legitimately started.
+       */
+      if (agreement.pending_intent_kind === 'acceptance') continue;
+
+      /**
+       * ═══ No card on file — say so, do not punish them for it. ═══
+       *
+       * An agreement accepted before stored credentials existed, or one whose acceptance settled
+       * without a reusable card, has nothing to charge. Marking that "missed" would drop the
+       * customer into Grace, start the late-fee clock and eventually threaten recovery of the goods
+       * — all for a failure that is entirely ours. Skipped and surfaced instead.
+       */
+      if (!agreement.payment_method_ref) {
+        await this.requestPaymentMethod(agreement as AgreementDoc, n);
+        continue;
+      }
+
       try {
+        /**
+         * OFF-SESSION. The customer is asleep; the card was saved at acceptance for exactly this.
+         * Previously this opened an ordinary on-session intent and immediately declared it complete,
+         * so the schedule the seller set could never collect anything at all.
+         */
         const charge = await paymentsService.charge({
           customerId: agreement.customer_id,
           counterpartyType: 'business',
@@ -969,7 +1046,37 @@ export const rtoService = {
           amountCents: inst.amount_cents,
           feeType: 'rto_installment',
           idempotencyKey: `rto_${agreementId}_${n}`,
+          paymentMethodId: agreement.payment_method_ref,
+          offSession: true,
         });
+
+        /**
+         * The bank wants the customer to authenticate (SCA / 3-D Secure). **Not a decline.** Their
+         * card is fine and they have done nothing wrong, so this must not touch the delinquency
+         * machinery — it needs them to open the app and confirm, once. Treating it as a failure
+         * would put someone into Grace, and eventually into recovery, for their bank's security
+         * policy.
+         */
+        if (charge.status === 'requires_action') {
+          await repo.updateAgreement(agreementId, {
+            action_required_intent_ref: charge.paymentIntentRef,
+            action_required_installment: n,
+          });
+          notificationsService.notify(agreement.customer_id, {
+            category: 'rto',
+            title: 'Your bank needs you to confirm a payment',
+            body: `Your bank asked you to approve the ${formatCents(inst.amount_cents)} payment for your ${agreement.product_name}. Nothing is wrong with your card — open the app to confirm it.`,
+            data: { agreementId, installmentNumber: n, actions: ['confirm_payment'] },
+          });
+          continue; // neither charged nor missed — it is waiting on the customer
+        }
+
+        if (charge.status !== 'succeeded') {
+          // An off-session intent that is neither succeeded nor requires_action has not collected.
+          // Fall into the missed path rather than crediting ownership against nothing.
+          throw new Error(`off-session charge status ${charge.status}`);
+        }
+
         const ledger = await repo.appendLedger({
           agreement_id: agreementId,
           entry_type: 'installment',
@@ -981,6 +1088,13 @@ export const rtoService = {
           idempotency_key: `rto_ledger_${agreementId}_${n}`,
         });
         if (!ledger) continue; // already recorded — skip (idempotent)
+        /**
+         * Settled here rather than waiting on the webhook, and legitimately so: an off-session
+         * confirm returns a TERMINAL status, so `succeeded` above is Stripe telling us the money
+         * moved. That is the opposite of the acceptance path, where the status is
+         * `requires_payment_method` and nothing has happened yet. The webhook still arrives and is
+         * a harmless no-op, because these transitions are all pending-guarded.
+         */
         await paymentsService.completeForOrder(charge.transactionId);
         await repo.claimInstallment(agreementId, n);
         await repo.setInstallmentTxn(agreementId, n, charge.transactionId);
@@ -1008,6 +1122,183 @@ export const rtoService = {
     // means a customer's payment lands hours after they budgeted for it.
     reportSweepBatch('rto-installments', due.length);
     return { charged, missed, completed };
+  },
+
+  /**
+   * There is no card to charge. Ask for one — do NOT mark the customer late.
+   *
+   * Notified once per agreement rather than on every sweep pass: an hourly reminder about the same
+   * missing card is nagging, and the instalment stays `scheduled` so it collects the moment a card
+   * is added. The `expiry_notice`-style guard is the agreement's own `action_required_installment`,
+   * reused here because "we need something from you before this can be paid" is the same state.
+   */
+  async requestPaymentMethod(agreement: AgreementDoc, installmentNumber: number): Promise<void> {
+    const agreementId = String(agreement._id);
+    if (agreement.action_required_installment === installmentNumber) return; // already asked
+
+    await repo.updateAgreement(agreementId, {
+      action_required_installment: installmentNumber,
+      action_required_intent_ref: null,
+    });
+    logger.warn(
+      { agreementId, installmentNumber },
+      'RTO instalment due with no saved card — cannot collect',
+    );
+    notificationsService.notify(agreement.customer_id, {
+      category: 'rto',
+      title: 'We need a payment method',
+      body: `We don't have a card saved for your ${agreement.product_name}, so we couldn't take this payment. Add one in the app — you are not late, and no fee has been added.`,
+      data: { agreementId, installmentNumber, actions: ['update_payment'] },
+    });
+  },
+
+  /**
+   * ═══ The customer is here; take the payment that could not be taken automatically. ═══
+   *
+   * Serves both stuck states with one path, because to the customer they are one problem — "my
+   * payment didn't go through and I want to fix it":
+   *
+   *  • an SCA challenge, where an intent already exists and simply needs confirming;
+   *  • no saved card at all, where a fresh on-session intent is opened AND the card is kept, so the
+   *    schedule can run itself again afterwards.
+   *
+   * Returns the client secret either way. Ownership is credited by the webhook, as everywhere else.
+   */
+  async resumeInstallment(principal: Principal, agreementId: string, idempotencyKey: string) {
+    const agreement = (await repo.findAgreementById(agreementId)) as AgreementDoc | null;
+    if (!agreement) throw NotFoundError('Agreement not found');
+    if (agreement.customer_id !== principal.userId) {
+      throw ForbiddenError('Not your agreement', ERROR_CODES.NOT_PARTICIPANT);
+    }
+
+    const n = agreement.action_required_installment;
+    if (!n) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'There is no payment waiting on you for this agreement',
+      );
+    }
+
+    /**
+     * An SCA challenge already has an intent with the money on it. Hand back THAT secret rather
+     * than opening a second charge — a new intent would take the payment twice if the first is
+     * later confirmed.
+     */
+    if (agreement.action_required_intent_ref) {
+      const intent = await stripe().retrievePaymentIntent(agreement.action_required_intent_ref);
+      if (intent.status === 'succeeded') {
+        // It cleared in the meantime. Nothing owed, and the flag is stale.
+        await repo.updateAgreement(agreementId, {
+          action_required_intent_ref: null,
+          action_required_installment: null,
+        });
+        return { agreementId, installmentNumber: n, clientSecret: null, alreadyPaid: true };
+      }
+      const txn = await paymentsService.findTransactionByPaymentIntent(
+        agreement.action_required_intent_ref,
+      );
+      return {
+        agreementId,
+        installmentNumber: n,
+        amountCents: txn?.amount_cents ?? null,
+        clientSecret: await paymentsService.clientSecretFor(agreement.action_required_intent_ref),
+        alreadyPaid: false,
+      };
+    }
+
+    // No card was ever saved. Open an on-session charge for the instalment AND keep the card, so
+    // the sweep can collect by itself from here on.
+    const schedule = await repo.installmentsForAgreement(agreementId);
+    const inst = schedule.find((s) => s.installment_number === n);
+    if (!inst || inst.status === 'paid') {
+      await repo.updateAgreement(agreementId, { action_required_installment: null });
+      return { agreementId, installmentNumber: n, clientSecret: null, alreadyPaid: true };
+    }
+
+    const charge = await paymentsService.charge({
+      customerId: principal.userId,
+      counterpartyType: 'business',
+      counterpartyId: agreement.seller_id,
+      amountCents: inst.amount_cents,
+      feeType: 'rto_installment',
+      idempotencyKey: `${idempotencyKey}_resume_${n}`,
+      savePaymentMethod: true,
+      ...(principal.email ? { customerEmail: principal.email } : {}),
+    });
+    await repo.updateAgreement(agreementId, {
+      action_required_intent_ref: charge.paymentIntentRef ?? null,
+    });
+    return {
+      agreementId,
+      installmentNumber: n,
+      amountCents: inst.amount_cents,
+      clientSecret: charge.clientSecret ?? null,
+      alreadyPaid: false,
+    };
+  },
+
+  /**
+   * ═══ Rescue an agreement whose settling webhook never arrived. ═══
+   *
+   * Ownership, the immutable ledger, the consignment split and the ownership TRANSFER are all
+   * driven by `payment_intent.succeeded` — which is the right design, and which makes a lost
+   * webhook expensive in a way it never was before. The failure modes:
+   *
+   *  • an ACCEPTANCE settles at Stripe and the event is dropped → the customer has paid their
+   *    deposit, owns nothing, and their instalment schedule stays frozen by the sweep guard;
+   *  • a PAYOFF settles and the event is dropped → they have paid off the item in full and the
+   *    system still says it is not theirs;
+   *  • a CARD SETUP completes and the event is dropped → no saved card, so every instalment on the
+   *    agreement is uncollectable.
+   *
+   * All three are silent: the customer's money is gone and nothing on any screen changes. Stripe is
+   * authoritative here, so this asks what actually happened rather than trusting our own row, and
+   * moves nothing forward unless Stripe says the money is there. Idempotent by construction — it
+   * reuses the webhook handlers, which no-op on anything no longer pending.
+   */
+  async reconcilePendingIntents(limit = SWEEP_BATCH_LIMIT): Promise<{
+    checked: number;
+    settled: number;
+  }> {
+    const cutoff = new Date(Date.now() - RTO_RECONCILE_AFTER_MS);
+    const { RtoAgreementModel } = await import('./rto.model');
+    const stuck = await RtoAgreementModel.find({
+      pending_intent_ref: { $ne: null },
+      updated_at: { $lte: cutoff },
+    })
+      .sort({ updated_at: 1 })
+      .limit(limit)
+      .lean()
+      .exec();
+
+    let settled = 0;
+    for (const a of stuck) {
+      const ref = String(a.pending_intent_ref);
+      const agreementId = String(a._id);
+      try {
+        if (a.pending_intent_kind === 'card_setup') {
+          const intent = await stripe().retrieveSetupIntent(ref);
+          if (intent.status !== 'succeeded') continue;
+          const res = await this.attachCardBySetupIntent(ref);
+          if (res.handled) settled += 1;
+        } else {
+          const intent = await stripe().retrievePaymentIntent(ref);
+          if (intent.status !== 'succeeded') continue;
+          const res = await this.creditByPaymentIntent(ref);
+          if (res.handled) settled += 1;
+        }
+        logger.warn(
+          { agreementId, intentRef: ref, kind: a.pending_intent_kind },
+          'settled a paid Rent-to-Own agreement whose webhook never arrived — check webhook delivery',
+        );
+      } catch (err) {
+        // One unreadable intent must not stop the others being rescued.
+        logger.error({ err, agreementId }, 'could not reconcile a Rent-to-Own payment');
+      }
+    }
+
+    reportSweepBatch('rto-reconcile', stuck.length);
+    return { checked: stuck.length, settled };
   },
 
   /**
@@ -1213,11 +1504,37 @@ Keep this reference. It is your record that the item is yours.`,
     if (['completed', 'cancelled'].includes(agreement.status)) {
       throw ConflictError(ERROR_CODES.INVALID_STATE_TRANSITION, `Agreement is ${agreement.status}`);
     }
+    /**
+     * An acceptance payment still in flight blocks a payoff. Paying off an agreement whose deposit
+     * has not cleared would credit ownership to full against an unconfirmed card — the same defect
+     * this whole path exists to close, reached by a different door.
+     */
+    if (agreement.pending_intent_kind === 'acceptance') {
+      throw ConflictError(
+        ERROR_CODES.INVALID_STATE_TRANSITION,
+        'Your first payment is still going through. Once it clears you can pay this off early.',
+      );
+    }
+
     const payoffCents = computePayoff(agreement.cash_price_cents, agreement.ownership_credited_cents ?? 0);
     if (payoffCents <= 0) {
+      // Nothing left to collect — every cent of the cash price is already credited, so ownership
+      // transfers here rather than waiting on a webhook for a charge that will never be opened.
       await this.completeAndTransfer(agreement);
-      return { agreementId, payoffCents: 0, completed: true };
+      return { agreementId, payoffCents: 0, completed: true, clientSecret: null, paymentIntentRef: null };
     }
+
+    /**
+     * ═══ Open the charge. Ownership transfers in the webhook, not here. ═══
+     *
+     * This used to append the payoff to the immutable ledger, credit ownership to the full cash
+     * price, and issue a proof-of-ownership reference — all off a PaymentIntent that had only just
+     * been created and that nobody had confirmed. The customer walked away owning the item outright,
+     * having paid nothing, with a signed record saying they had. Of every place the missing capture
+     * bit, this was the expensive one.
+     *
+     * `creditByPaymentIntent` does all four of those things now, on `payment_intent.succeeded`.
+     */
     const charge = await paymentsService.charge({
       customerId: principal.userId,
       counterpartyType: 'business',
@@ -1226,29 +1543,220 @@ Keep this reference. It is your record that the item is yours.`,
       feeType: 'rto_installment',
       idempotencyKey: `${idempotencyKey}_payoff`,
     });
-    const ledger = await repo.appendLedger({
-      agreement_id: agreementId,
-      entry_type: 'payoff',
-      installment_number: null,
-      amount_cents: payoffCents,
-      fee_cents: charge.platformFeeCents ?? 0,
-      ownership_credit_cents: payoffCents,
-      transaction_id: charge.transactionId,
-      idempotency_key: `rto_payoff_${agreementId}`,
+    await repo.updateAgreement(agreementId, {
+      pending_intent_ref: charge.paymentIntentRef ?? null,
+      pending_intent_kind: 'payoff',
     });
-    if (ledger) {
-      await paymentsService.completeForOrder(charge.transactionId);
-      await repo.updateAgreement(agreementId, {
+    return {
+      agreementId,
+      payoffCents,
+      /**
+       * False, and said plainly. The old `completed: true` was returned before the card had been
+       * seen, so the screen congratulated the customer on owning something they had not bought.
+       */
+      completed: false,
+      clientSecret: charge.clientSecret ?? null,
+      paymentIntentRef: charge.paymentIntentRef ?? null,
+    };
+  },
+
+  /**
+   * ═══ SETTLEMENT. The one place a Rent-to-Own payment becomes real. ═══
+   *
+   * Driven by `payment_intent.succeeded`. Everything that used to happen optimistically at the
+   * moment a charge was OPENED happens here instead, once Stripe says the money exists: the
+   * immutable ledger entry, the ownership credit, the consignment split, and — on a payoff — the
+   * ownership transfer itself.
+   *
+   * Returns `{ handled: false }` for an intent that is not ours, so the webhook's chain of handlers
+   * falls through to the next one exactly as the other modules' credit paths do.
+   */
+  /**
+   * The customer entered a card on an agreement that owed nothing on day one. No money moved and
+   * none should have — this only attaches the credential the schedule will be charged against.
+   *
+   * Driven by `setup_intent.succeeded`. Separate from `creditByPaymentIntent` because there is
+   * nothing to credit: no ledger entry, no ownership, no split. Conflating the two would mean a
+   * card-collection event walking the money path.
+   */
+  async attachCardBySetupIntent(setupIntentRef: string): Promise<{ handled: boolean }> {
+    const found = await repo.findAgreementByPendingIntent(setupIntentRef);
+    if (!found || found.pending_intent_kind !== 'card_setup') return { handled: false };
+
+    const agreementId = String(found._id);
+    const claimed = await repo.claimPendingIntent(agreementId, setupIntentRef);
+    if (!claimed) return { handled: true }; // a duplicate delivery lost the race
+
+    let paymentMethodRef: string | null = null;
+    try {
+      const intent = await stripe().retrieveSetupIntent(setupIntentRef);
+      paymentMethodRef = intent.paymentMethodId ?? null;
+    } catch (err) {
+      logger.error({ err, agreementId }, 'could not read the RTO setup intent');
+    }
+
+    if (!paymentMethodRef) {
+      logger.warn(
+        { agreementId, setupIntentRef },
+        'RTO card setup completed with no reusable card — instalments cannot be collected',
+      );
+      return { handled: true };
+    }
+
+    await repo.updateAgreement(agreementId, { payment_method_ref: paymentMethodRef });
+    await writeAudit({
+      action: 'rto.card_saved',
+      entityType: 'rto_agreement',
+      entityId: agreementId,
+      metadata: { setupIntentRef },
+    });
+    return { handled: true };
+  },
+
+  async creditByPaymentIntent(paymentIntentRef: string): Promise<{ handled: boolean }> {
+    const found = await repo.findAgreementByPendingIntent(paymentIntentRef);
+    if (!found) return { handled: false }; // not an RTO payment — let the next handler try
+
+    const agreementId = String(found._id);
+    const kind = found.pending_intent_kind;
+
+    /**
+     * Claim it. Stripe delivers at least once, and crediting twice would hand the customer double
+     * the ownership they paid for; the ledger's unique keys would catch the duplicate entry, but
+     * the ownership write is a `$set` that would happily run again.
+     */
+    const agreement = (await repo.claimPendingIntent(agreementId, paymentIntentRef)) as AgreementDoc | null;
+    if (!agreement) return { handled: true }; // a concurrent delivery won the race
+
+    /**
+     * The fee that was actually taken, read back from the transaction rather than recomputed. A fee
+     * rule can change between opening the charge and the customer confirming their card, and the
+     * ledger must record what Stripe took, not what today's schedule would have taken.
+     */
+    const txn = await paymentsService.findTransactionByPaymentIntent(paymentIntentRef);
+    const transactionId = txn ? String(txn._id) : null;
+    const platformFeeCents = txn?.platform_fee_cents ?? 0;
+
+    if (kind === 'acceptance') {
+      /**
+       * The initial payment and the set-up fee arrived on ONE intent but are TWO ledger entries,
+       * because they are two different kinds of money: the initial payment is 100% equity and the
+       * set-up fee buys the customer nothing. Folding them together would make the set-up fee look
+       * like progress toward ownership.
+       *
+       * The platform fee sits entirely on the initial-payment line — it was levied on that base
+       * alone (the set-up fee rode in as `serviceFeeCents`), so attributing any of it to the set-up
+       * line would misstate both.
+       */
+      const initialCents = agreement.initial_payment_cents ?? 0;
+      const setupCents = agreement.setup_fee_cents ?? 0;
+
+      if (initialCents > 0) {
+        await repo.appendLedger({
+          agreement_id: agreementId,
+          entry_type: 'initial',
+          installment_number: null,
+          amount_cents: initialCents,
+          fee_cents: platformFeeCents,
+          // The initial payment is 100% equity (rto.pricing) — credit equals amount.
+          ownership_credit_cents: initialCents,
+          transaction_id: transactionId,
+          idempotency_key: `rto_initial_${agreementId}`,
+        });
+      }
+      if (setupCents > 0) {
+        await repo.appendLedger({
+          agreement_id: agreementId,
+          entry_type: 'setup_fee',
+          installment_number: null,
+          amount_cents: setupCents,
+          fee_cents: 0,
+          ownership_credit_cents: 0, // a set-up fee is a cost, never equity
+          transaction_id: transactionId,
+          idempotency_key: `rto_setup_${agreementId}`,
+        });
+      }
+
+      /**
+       * Capture the card the customer just used. Read back from Stripe rather than remembered from
+       * the charge call, because the payment method only exists once they have actually confirmed —
+       * at charge time there is no card yet, which is the whole reason this happens here.
+       *
+       * Every later instalment is charged against this. Without it the schedule cannot collect.
+       */
+      let paymentMethodRef: string | null = null;
+      try {
+        const intent = await stripe().retrievePaymentIntent(paymentIntentRef);
+        paymentMethodRef = intent.paymentMethodId ?? null;
+      } catch (err) {
+        // Never fail a settled payment over this — the money HAS arrived and the customer owns
+        // their share of it. A missing card is recoverable (they are asked for one); a webhook that
+        // throws here would lose the credit entirely.
+        logger.error({ err, agreementId }, 'could not capture the RTO payment method');
+      }
+      if (!paymentMethodRef) {
+        logger.warn(
+          { agreementId, paymentIntentRef },
+          'RTO acceptance settled with no reusable card — instalments cannot be collected until one is added',
+        );
+      }
+
+      const credited = await repo.updateAgreement(agreementId, {
+        ownership_credited_cents: initialCents,
+        ...(paymentMethodRef ? { payment_method_ref: paymentMethodRef } : {}),
+      });
+      // Split from the CREDITED doc: the consignment split reads the running ownership credit, so
+      // it must see the payment it is dividing, not the state from before it landed.
+      if (initialCents > 0) {
+        await this.recordSplit((credited ?? agreement) as AgreementDoc, null, 'initial', initialCents);
+      }
+    } else if (kind === 'payoff') {
+      const payoffCents = computePayoff(
+        agreement.cash_price_cents,
+        agreement.ownership_credited_cents ?? 0,
+      );
+      await repo.appendLedger({
+        agreement_id: agreementId,
+        entry_type: 'payoff',
+        installment_number: null,
+        amount_cents: payoffCents,
+        fee_cents: platformFeeCents,
+        ownership_credit_cents: payoffCents,
+        transaction_id: transactionId,
+        idempotency_key: `rto_payoff_${agreementId}`,
+      });
+      const credited = await repo.updateAgreement(agreementId, {
         ownership_credited_cents: agreement.cash_price_cents,
       });
+      /**
+       * The payoff was never split. On a consignment agreement that meant the owner was paid their
+       * share of every instalment and nothing at all of the payment that bought the item outright —
+       * and `getStatements` reconciliation reported the shortfall as drift with no explanation.
+       */
+      if (payoffCents > 0) {
+        await this.recordSplit((credited ?? agreement) as AgreementDoc, null, 'payoff', payoffCents);
+      }
       await this.completeAndTransfer({
         _id: agreement._id,
         customer_id: agreement.customer_id,
         product_name: agreement.product_name,
         seller_id: agreement.seller_id,
       });
+    } else {
+      logger.warn({ agreementId, paymentIntentRef }, 'RTO payment settled with no pending kind');
+      return { handled: true };
     }
-    return { agreementId, payoffCents, completed: true };
+
+    // Settle the transaction itself. This handler `break`s the webhook's chain before the generic
+    // fallthrough, so nothing else will do it and the charge would otherwise stay `pending` forever.
+    await paymentsService.completeByPaymentIntent(paymentIntentRef);
+    await writeAudit({
+      action: kind === 'payoff' ? 'rto.payoff_settled' : 'rto.acceptance_settled',
+      entityType: 'rto_agreement',
+      entityId: agreementId,
+      metadata: { paymentIntentRef, transactionId },
+    });
+    return { handled: true };
   },
 
   /** Progress dashboard (U9): next due, balance, made/remaining, ownership %, live payoff amount. */
@@ -1415,15 +1923,20 @@ Keep this reference. It is your record that the item is yours.`,
   },
 
   dashboardFrom(agreement: AgreementDoc, quote: ReturnType<typeof computeRtoQuote>) {
+    /**
+     * Ownership comes from the AGREEMENT, not the quote. The quote says what the initial payment
+     * WOULD credit; the agreement says what has actually been credited, which is nothing until the
+     * card clears. Reading the quote here would put "you own 20%" on the screen at the exact moment
+     * the customer had paid nothing — the same lie the stored field used to tell.
+     */
+    const credited = agreement.ownership_credited_cents ?? 0;
     return {
       ...this.summaryView(agreement),
       nextDueAt: agreement.next_due_at,
       installmentsRemaining: agreement.installment_count,
       ownershipPercent:
-        quote.cashPriceCents > 0
-          ? Math.round((quote.initialOwnershipCreditCents / quote.cashPriceCents) * 100)
-          : 0,
-      payoffCents: computePayoff(quote.cashPriceCents, quote.initialOwnershipCreditCents),
+        quote.cashPriceCents > 0 ? Math.round((credited / quote.cashPriceCents) * 100) : 0,
+      payoffCents: computePayoff(quote.cashPriceCents, credited),
       totalToOwnCents: quote.totalToOwnCents,
       costOverCashCents: quote.costOverCashCents,
     };
@@ -1457,6 +1970,19 @@ Keep this reference. It is your record that the item is yours.`,
           }
         : null,
       arrearsPaidCents: a.arrears_paid_cents ?? 0,
+      /**
+       * A scheduled payment that could not be taken automatically and is now waiting on the
+       * customer — either the bank asked them to authenticate it, or we have no card saved. Neither
+       * is delinquency and neither is their fault, so it is reported as its own state rather than
+       * being folded into Grace. `hasSavedCard` is what tells the screen which of the two it is.
+       */
+      paymentActionRequired: a.action_required_installment
+        ? {
+            installmentNumber: a.action_required_installment,
+            reason: a.action_required_intent_ref ? ('authenticate' as const) : ('no_card' as const),
+          }
+        : null,
+      hasSavedCard: Boolean(a.payment_method_ref),
       returnRequestedAt: a.return_requested_at ?? null,
       returnRequestedBy: a.return_requested_by ?? null,
       returnDisclosure: a.return_disclosure ?? null,
