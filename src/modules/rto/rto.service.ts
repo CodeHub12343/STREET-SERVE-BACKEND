@@ -1864,7 +1864,14 @@ Keep this reference. It is your record that the item is yours.`,
     if (!isCustomer && owner !== principal.userId)
       throw ForbiddenError('Not a participant', ERROR_CODES.NOT_PARTICIPANT);
     const schedule = await repo.installmentsForAgreement(agreementId);
-    return this.dashboard(agreement, schedule);
+    /**
+     * What they have ACTUALLY paid, from the immutable ledger. A completed agreement showing
+     * "total to own $240" overstates it whenever the customer paid off early — they paid the
+     * remaining equity, not the full rental total — and telling someone they paid more than they
+     * did is a strange way to end a deal that went well.
+     */
+    const paidAgg = await repo.sumLedgerAmount(agreementId);
+    return this.dashboard(agreement, schedule, paidAgg[0]?.total ?? 0);
   },
 
   async listMine(principal: Principal, limit: number) {
@@ -2007,6 +2014,7 @@ Keep this reference. It is your record that the item is yours.`,
   dashboard(
     agreement: AgreementDoc,
     schedule: { status: string; due_at: Date; amount_cents: number; installment_number: number }[],
+    totalPaidCents = 0,
   ) {
     const cash = agreement.cash_price_cents;
     const credited = agreement.ownership_credited_cents ?? 0;
@@ -2017,6 +2025,22 @@ Keep this reference. It is your record that the item is yours.`,
       installmentsRemaining: Math.max(0, agreement.installment_count - paid),
       ownershipPercent: cash > 0 ? Math.min(100, Math.round((credited / cash) * 100)) : 0,
       payoffCents: computePayoff(cash, credited),
+      /** Everything the customer has actually handed over, from the immutable ledger. */
+      totalPaidCents,
+      /**
+       * What paying off early saved them, against the full rental total they would have paid by
+       * running the schedule to its end.
+       *
+       * Floored at zero: a schedule run to completion saves nothing, and a "saving" of minus four
+       * dollars is worse than saying nothing at all. This exists because a finished agreement was
+       * still headlining "Total to own $240" — which the customer never paid, having cleared the
+       * remaining equity early. Telling someone they paid more than they did is a strange way to
+       * end a deal that went well.
+       */
+      savedByPayingEarlyCents:
+        agreement.status === 'completed'
+          ? Math.max(0, agreement.total_to_own_cents - totalPaidCents)
+          : 0,
       /**
        * The very next payment, as one object rather than three loose fields. The screen needs to say
        * "£18.34 on 23 Aug, taken automatically" in one sentence, and assembling that from a date
@@ -2072,6 +2096,8 @@ Keep this reference. It is your record that the item is yours.`,
       installmentsPaid: a.installments_paid ?? 0,
       ownershipCreditedCents: a.ownership_credited_cents ?? 0,
       proofOfOwnership: a.proof_of_ownership_ref ?? null,
+      /** The moment it became theirs. Stored since R25 and never surfaced. */
+      ownershipTransferredAt: a.ownership_transferred_at ?? null,
       isConsignment: a.is_consignment ?? false,
       /**
        * §50/§51/§52 lifecycle state. A remedy the customer cannot see is a remedy they will not
