@@ -787,3 +787,60 @@ describe('shelter reporting stays aggregate-only', () => {
     expect(JSON.stringify(res.body.data)).not.toContain('resident_user_id');
   });
 });
+
+/**
+ * ═══ The staff console could not find its own shelter. ═══
+ *
+ * `/shelter` took its partner id from a `?partner=` query string that nothing in the app ever
+ * generated, and no endpoint existed to supply one. So every shelter admin who had ever been
+ * registered opened the console and was told "No shelter linked to this account" — while the
+ * console behind it was complete, and their organisation was sitting verified in the database.
+ *
+ * The registration itself was silent too: the role was granted, the whole programme moved onto
+ * their side of the app, and nobody told them.
+ */
+describe('B-6: a shelter admin can find their own shelter', () => {
+  it('answers "which shelter do I run?" and reports its real state', async () => {
+    const { partnerId, staffToken } = await makeShelter('b6mine');
+
+    const res = await request(app)
+      .get('/api/v1/shelter-partners/mine')
+      .set(...bearer(staffToken));
+
+    expect(res.status).toBe(200);
+    expect(res.body.data).toMatchObject({
+      id: partnerId,
+      organizationName: 'b6mine Hope Center',
+      status: 'verified',
+      // A brand-new partnership, reported honestly rather than as an error.
+      residentsEnrolled: 0,
+      custodyHeldCents: 0,
+    });
+  });
+
+  it('tells the person they can now enrol residents', async () => {
+    const { staffId } = await makeShelter('b6notify');
+
+    const { NotificationModel } = await import('../src/modules/notifications/notifications.model');
+    const notifications = await NotificationModel.find({ user_id: staffId }).lean();
+
+    const welcome = notifications.find((n) => /approved/i.test(n.title));
+    expect(welcome).toBeTruthy();
+    // It has to say what to DO — an approval nobody can act on is not an approval.
+    expect(welcome!.body).toMatch(/enrol/i);
+  });
+
+  it('returns null — not an error — for someone who runs no shelter', async () => {
+    await seedUser({ authProviderId: 'b6none|user', roles: ['customer'] });
+    const token = await mintToken('b6none|user');
+
+    const res = await request(app).get('/api/v1/shelter-partners/mine').set(...bearer(token));
+    expect(res.status).toBe(200);
+    expect(res.body.data).toBeNull();
+  });
+
+  it('is not readable by an anonymous caller — it names an organisation and its balances', async () => {
+    const res = await request(app).get('/api/v1/shelter-partners/mine');
+    expect(res.status).toBe(401);
+  });
+});

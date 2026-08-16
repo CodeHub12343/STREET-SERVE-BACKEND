@@ -81,6 +81,21 @@ export const shelterService = {
         : {}),
     });
     await identityService.grantRole(input.ownerUserId, 'shelter_admin', admin.userId);
+
+    /**
+     * TELL THEM. The whole programme now runs on their side of the app and nothing said so.
+     *
+     * An admin registered an organisation, the role was granted silently, and the person who is
+     * meant to do every subsequent step — enrolling residents, holding their money, disbursing it —
+     * was never informed that they could. They had no reason to open the app, and nothing to look
+     * for if they did.
+     */
+    notificationsService.notify(input.ownerUserId, {
+      category: 'system',
+      title: `${input.organizationName} is approved`,
+      body: 'You can now enrol residents. Open the Shelter program from the mode switcher to get started — each resident you enrol gets a code to link their account.',
+      data: { partnerId: String(partner._id), deeplink: '/shelter' },
+    });
     await writeAudit({
       actorId: admin.userId,
       actorRole: 'admin',
@@ -202,6 +217,49 @@ export const shelterService = {
        * most likely reason to be doing it — but it is the next thing that needs handling.
        */
       custodyHeldCents: heldAgg[0]?.total ?? 0,
+    };
+  },
+
+  /**
+   * WHICH SHELTER DO I RUN?
+   *
+   * The staff console took its partner id from a query string and there was no way to obtain one:
+   * `/shelter` therefore rendered "No shelter linked to this account" for every shelter admin who
+   * had ever been registered, because nothing could tell them their own partner id. The console
+   * behind it was complete the whole time.
+   *
+   * Returns null rather than throwing — "you do not run a shelter" is an ordinary answer for most
+   * of the people who will ever hit this route, not an error.
+   */
+  async myPartner(principal: Principal) {
+    const partner = await ShelterPartnerModel.findOne({ owner_user_id: principal.userId })
+      .lean()
+      .exec();
+    if (!partner) return null;
+
+    const partnerId = String(partner._id);
+    const [residentsEnrolled, custodyHeld] = await Promise.all([
+      ShelterEnrollmentModel.countDocuments({
+        shelter_partner_id: partnerId,
+        status: 'active',
+      }).exec(),
+      ShelterCustodyModel.aggregate<{ _id: null; total: number }>([
+        { $match: { shelter_partner_id: partnerId, status: 'held' } },
+        { $group: { _id: null, total: { $sum: '$amount_cents' } } },
+      ]).exec(),
+    ]);
+
+    return {
+      id: partnerId,
+      organizationName: partner.organization_name,
+      /**
+       * Reported so the console can say WHY it is refusing to work rather than just refusing.
+       * A suspended partner keeps existing residents but takes no new ones.
+       */
+      status: partner.status,
+      custodyAccepted: Boolean(partner.custody_accepted_at),
+      residentsEnrolled,
+      custodyHeldCents: custodyHeld[0]?.total ?? 0,
     };
   },
 

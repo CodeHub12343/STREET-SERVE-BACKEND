@@ -120,6 +120,23 @@ shelterRouter.patch(
 );
 
 // ─── Admin: partner registration ────────────────────────────────────────────────────────────
+/**
+ * The shelter this staff member runs. Without it the console had no way to learn its own partner
+ * id, so `/shelter` showed "No shelter linked to this account" to every shelter admin ever
+ * registered.
+ *
+ * Declared BEFORE `/:id` routes: Express matches in order, and `/mine` would otherwise be captured
+ * as an id and fail validation.
+ */
+shelterRouter.get(
+  '/mine',
+  rateLimit('read'),
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(res, await shelterService.myPartner(principal(req)));
+  }),
+);
+
 shelterRouter.post(
   '/',
   rateLimit('write'),
