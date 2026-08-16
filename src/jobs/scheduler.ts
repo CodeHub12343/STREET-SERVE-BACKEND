@@ -184,6 +184,24 @@ export async function registerScheduledJobs(connection: Redis): Promise<void> {
     { repeat: { every: 86_400_000 }, jobId: 'payforward-expiry-notice', removeOnComplete: true },
   );
   await sweeps.add(
+    'payforward-abandoned',
+    {},
+    /**
+     * Every 10 minutes. Community money committed to a checkout nobody paid for is unusable by the
+     * person it was meant for, and on a fully covered order there is no declined card to notice.
+     */
+    { repeat: { every: 600_000 }, jobId: 'payforward-abandoned', removeOnComplete: true },
+  );
+  await sweeps.add(
+    'rto-reconcile',
+    {},
+    /**
+     * Every 15 minutes. A dropped webhook here means a customer has paid a deposit and owns
+     * nothing, or has paid off an item the system still says is not theirs.
+     */
+    { repeat: { every: 900_000 }, jobId: 'rto-reconcile', removeOnComplete: true },
+  );
+  await sweeps.add(
     'payforward-reconcile',
     {},
     /**

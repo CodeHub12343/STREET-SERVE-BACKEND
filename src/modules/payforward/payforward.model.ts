@@ -85,6 +85,17 @@ const CommunityContributionSchema = new Schema(
     remaining_cents: { type: Number, required: true, min: 0 },
     stripe_payment_intent_id: { type: String, required: true, unique: true },
     status: { type: String, enum: ['pending', 'succeeded', 'failed'], default: 'pending' },
+    /**
+     * ADR-005 §7 — the change-of-mind window, and what it actually returned.
+     *
+     * Deliberately NOT a status. A gift that was $20, of which $6 fed somebody before the giver
+     * changed their mind, is still a $6 contribution — flipping it to `refunded` would erase a
+     * meal that genuinely happened from every impact figure. The status stays `succeeded` and this
+     * records the part that came back, so `contributedCents` can net it out honestly.
+     */
+    refunded_cents: { type: Number, default: 0 },
+    refunded_at: { type: Date, default: null },
+    stripe_refund_id: { type: String, default: null },
     failure_reason: { type: String, default: null },
     /**
      * Anonymity is the DEFAULT and is enforced at serialisation, never in the UI. Recognition is

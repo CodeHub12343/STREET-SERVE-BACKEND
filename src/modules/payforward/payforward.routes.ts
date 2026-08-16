@@ -8,7 +8,12 @@ import { requirePermission } from '../../middleware/rbac';
 import { requireModule } from '../../middleware/requireModule';
 import { validate } from '../../middleware/validate';
 import { payforwardController } from './payforward.controller';
-import { BusinessIdParam, ContributeBody, FundSettingsBody } from './payforward.schema';
+import {
+  BusinessIdParam,
+  ContributeBody,
+  ContributionIdParam,
+  FundSettingsBody,
+} from './payforward.schema';
 
 /**
  * Pay It Forward (ADR-005). Mounted at `/pay-it-forward`.
@@ -32,6 +37,20 @@ payforwardRouter.get(
   authenticate,
   requirePermission('payforward:contribute'),
   asyncHandler(payforwardController.mine),
+);
+
+/**
+ * ADR-005 §7 — the change-of-mind window. Money-path, so idempotency-keyed: a double tap must not
+ * attempt two refunds against the same gift.
+ */
+payforwardRouter.post(
+  '/contributions/:contributionId/refund',
+  rateLimit('money'),
+  authenticate,
+  requirePermission('payforward:contribute'),
+  idempotency,
+  validate({ params: ContributionIdParam }),
+  asyncHandler(payforwardController.refundContribution),
 );
 
 payforwardRouter.get(

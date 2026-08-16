@@ -135,6 +135,30 @@ export const PAY_FORWARD_EXPIRY_NOTICE_DAYS = 30;
  * Stripe's retry window, so a genuinely-delivered webhook always wins.
  */
 export const PAY_FORWARD_RECONCILE_AFTER_MS = 15 * 60_000;
+/**
+ * ADR-005 §7 — how long a giver has to take a gift back.
+ *
+ * Only the UNSPENT remainder is ever returned. Money that has already covered someone's order is
+ * gone in the only sense that matters: a person ate. Clawing that back would mean either asking
+ * them to give a meal back or making the platform absorb a loss anyone could trigger deliberately.
+ */
+export const PAY_FORWARD_REFUND_WINDOW_MS = 24 * 60 * 60_000;
+/**
+ * How long a covered order may hold community money before an unpaid checkout releases it.
+ *
+ * The fund is committed when the order is PLACED, but `release` only fires when the charge throws —
+ * a customer who simply closes the payment sheet consumed the money permanently. Long enough for a
+ * slow payment or a dropped connection; short enough that a small pool is not held hostage through
+ * a lunch service by people who wandered off.
+ */
+export const PAY_FORWARD_ABANDON_AFTER_MS = 30 * 60_000;
+
+/**
+ * How long a Rent-to-Own agreement may sit on an unsettled intent before the reconcile sweep asks
+ * Stripe directly. A grace period rather than zero, so the sweep never races the webhook it exists
+ * to back up — and comfortably inside Stripe's own retry window, so a delivered event always wins.
+ */
+export const RTO_RECONCILE_AFTER_MS = 15 * 60_000;
 /** Floor on a contribution. Below this the processing fee is most of the gift. */
 export const PAY_FORWARD_MIN_CONTRIBUTION_CENTS = 100;
 /**

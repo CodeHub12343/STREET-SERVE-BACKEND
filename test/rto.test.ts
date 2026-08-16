@@ -342,6 +342,79 @@ describe('RTO disclosure + acceptance (R20/R21/R26)', () => {
     expect(payoff.status).toBe(409);
   });
 
+  /**
+   * ═══ The webhook is now load-bearing, so a lost one has to be survivable. ═══
+   *
+   * Ownership, the ledger, the split and the ownership transfer all hang off
+   * `payment_intent.succeeded`. That is the right design, and it makes a dropped event expensive in
+   * a way it never was before: the customer has paid their deposit, owns nothing, and their
+   * schedule stays frozen by the sweep guard — silently, with nothing on any screen to show it.
+   */
+  it('settles an acceptance whose webhook never arrived', async () => {
+    const seller = await approvedSeller('rto-losthook');
+    const listingId = await publishListing(seller);
+    const token = await customer('rto-losthook');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-losthook-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+
+    // The card clears at Stripe. The event never reaches us.
+    expect((await RtoAgreementModel.findById(agreementId).lean())!.ownership_credited_cents).toBe(0);
+
+    // Age it past the grace period so the sweep stops treating it as in flight.
+    await RtoAgreementModel.collection.updateOne(
+      { _id: (await RtoAgreementModel.findById(agreementId).lean())!._id },
+      { $set: { updated_at: new Date(Date.now() - 3_600_000) } },
+    );
+
+    const swept = await rtoService.reconcilePendingIntents();
+    expect(swept.settled).toBeGreaterThanOrEqual(1);
+
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.ownership_credited_cents).toBe(2000);
+    expect(row!.pending_intent_ref).toBeNull();
+    // And the card was captured, so the schedule can run.
+    expect(row!.payment_method_ref).toEqual(expect.any(String));
+    expect(
+      await RtoLedgerEntryModel.countDocuments({ agreement_id: agreementId, entry_type: 'initial' }),
+    ).toBe(1);
+
+    // Idempotent: a webhook that turns up late, or a second sweep, credits nothing further.
+    await rtoService.reconcilePendingIntents();
+    expect(
+      (await RtoAgreementModel.findById(agreementId).lean())!.ownership_credited_cents,
+    ).toBe(2000);
+  });
+
+  /** An intent still awaiting a card is in flight, not lost. The sweep must not race the webhook. */
+  it('leaves an unpaid agreement alone', async () => {
+    const seller = await approvedSeller('rto-inflight');
+    const listingId = await publishListing(seller);
+    const token = await customer('rto-inflight');
+    const accept = await request(app)
+      .post('/api/v1/rto/agreements')
+      .set(...bearer(token))
+      .set('Idempotency-Key', 'rto-inflight-1')
+      .send({ listingId });
+    const agreementId = accept.body.data.id as string;
+
+    const ref = (await RtoAgreementModel.findById(agreementId).lean())!.pending_intent_ref!;
+    fakeStripe.setIntentStatus(ref, 'requires_payment_method');
+    await RtoAgreementModel.collection.updateOne(
+      { _id: (await RtoAgreementModel.findById(agreementId).lean())!._id },
+      { $set: { updated_at: new Date(Date.now() - 3_600_000) } },
+    );
+
+    await rtoService.reconcilePendingIntents();
+
+    const row = await RtoAgreementModel.findById(agreementId).lean();
+    expect(row!.ownership_credited_cents).toBe(0);
+    expect(row!.pending_intent_ref).toBe(ref); // still waiting, not written off
+  });
+
   /** A webhook is delivered at least once — twice must not mean twice the equity. */
   it('credits an acceptance exactly once, however many times Stripe delivers it', async () => {
     const seller = await approvedSeller('rto-dupe');

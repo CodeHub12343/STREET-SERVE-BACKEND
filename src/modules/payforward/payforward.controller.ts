@@ -5,7 +5,12 @@ import { body, params } from '../../middleware/validate';
 import { created, ok } from '../../shared/respond';
 import { UnauthenticatedError, ValidationError } from '../../shared/errors/AppError';
 import type { Principal } from '../../shared/types/principal';
-import type { BusinessIdParam, ContributeBody, FundSettingsBody } from './payforward.schema';
+import type {
+  BusinessIdParam,
+  ContributeBody,
+  ContributionIdParam,
+  FundSettingsBody,
+} from './payforward.schema';
 import { payforwardService } from './payforward.service';
 
 function principal(req: Request): Principal {
@@ -51,5 +56,11 @@ export const payforwardController = {
   /** The caller's own gifts, including the ones that are still pending or that failed. */
   mine: async (req: Request, res: Response): Promise<void> => {
     ok(res, await payforwardService.myContributions(principal(req).userId));
+  },
+
+  /** ADR-005 §7 — take back the unspent part of a gift, within 24 hours. */
+  refundContribution: async (req: Request, res: Response): Promise<void> => {
+    const { contributionId } = params<z.infer<typeof ContributionIdParam>>(req);
+    ok(res, await payforwardService.refundContribution(principal(req), contributionId));
   },
 };

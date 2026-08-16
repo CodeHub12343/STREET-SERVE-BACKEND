@@ -3,8 +3,10 @@ import {
   PAY_FORWARD_DEFAULT_EXPIRY_DAYS,
   PAY_FORWARD_EXPIRY_NOTICE_DAYS,
   PAY_FORWARD_MAX_CONTRIBUTION_CENTS,
+  PAY_FORWARD_ABANDON_AFTER_MS,
   PAY_FORWARD_MIN_CONTRIBUTION_CENTS,
   PAY_FORWARD_RECONCILE_AFTER_MS,
+  PAY_FORWARD_REFUND_WINDOW_MS,
   PAY_FORWARD_REDEEM_MIN_TIER,
   TIER_RANK,
 } from '../../config/constants';
@@ -103,6 +105,17 @@ async function ensureOwner(principal: Principal, businessId: string): Promise<vo
   if (owner !== principal.userId) {
     throw ForbiddenError('You do not own this business', ERROR_CODES.NOT_OWNER);
   }
+}
+
+/**
+ * How much of a gift could be taken back right now (ADR-005 §7): the unspent remainder, and only
+ * inside the window. Zero once any of those stops being true — the caller then simply does not
+ * offer it, and `refundContribution` re-checks with the reasons.
+ */
+function refundableNow(creditedAt: Date | null | undefined, remainingCents: number): number {
+  if (!creditedAt || remainingCents <= 0) return 0;
+  const open = Date.now() <= creditedAt.getTime() + PAY_FORWARD_REFUND_WINDOW_MS;
+  return open ? remainingCents : 0;
 }
 
 async function getOrCreateFund(businessId: string) {
@@ -393,6 +406,149 @@ export const payforwardService = {
     return { checked: pending.length, credited, failed };
   },
 
+  /**
+   * ═══ ADR-005 §7 — take a gift back, within 24 hours, unspent part only. ═══
+   *
+   * The window existed on paper and nowhere else: the ledger leg was written and correct, but only
+   * Boost ever called it, so a Pay It Forward gift was final the instant it settled. Someone who
+   * mistyped $200 for $20 had no way back except a support ticket.
+   *
+   * **Only `remaining_cents` is refundable, and that is the whole design.** Money that has already
+   * covered an order is gone in the only sense that matters — a person ate. Returning it would mean
+   * either asking them to give the meal back, or making the platform absorb a loss that anyone
+   * could trigger deliberately by giving, waiting for a redemption, and reversing.
+   *
+   * The vendor is not told. They were notified when it arrived; a reversal notice would invite them
+   * to treat a custodial pool as revenue being taken away, which it never was.
+   */
+  async refundContribution(principal: Principal, contributionId: string) {
+    const contribution = await CommunityContributionModel.findById(contributionId).exec();
+    if (!contribution) throw NotFoundError('Contribution not found');
+    if (contribution.contributor_id !== principal.userId) {
+      throw ForbiddenError('Not your contribution', ERROR_CODES.NOT_OWNER);
+    }
+    if (contribution.status !== 'succeeded') {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        contribution.status === 'pending'
+          ? 'This gift has not been charged yet. Nothing has left your account.'
+          : 'This gift never went through, so there is nothing to return.',
+      );
+    }
+
+    /**
+     * The window runs from when the money actually ARRIVED, not from when the gift was requested —
+     * a card that took ten minutes to clear must not eat ten minutes of the giver's 24 hours. The
+     * fallbacks only matter for rows written before `credited_at` existed.
+     */
+    const creditedAt = contribution.credited_at ?? contribution.created_at ?? new Date();
+    const deadline = new Date(creditedAt.getTime() + PAY_FORWARD_REFUND_WINDOW_MS);
+    if (Date.now() > deadline.getTime()) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'The 24-hour window for taking this gift back has passed. It is waiting for someone who needs it.',
+      );
+    }
+
+    const refundable = contribution.remaining_cents;
+    if (refundable <= 0) {
+      /**
+       * Named precisely rather than "cannot refund". The giver's money did exactly what they
+       * intended — telling them it "failed" would be both wrong and unkind.
+       */
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'This gift has already gone to someone, so there is nothing left to return.',
+      );
+    }
+
+    /**
+     * Take it out of the pool FIRST, guarded, and only then move real money. The other order would
+     * refund a card and then discover the pool had been drawn down in the meantime — leaving the
+     * platform short by an amount it had already paid out.
+     */
+    const debited = await CommunityFundModel.findOneAndUpdate(
+      { business_id: contribution.business_id, balance_cents: { $gte: refundable } },
+      { $inc: { balance_cents: -refundable } },
+      { new: true },
+    ).exec();
+    if (!debited) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'Someone is using this fund right now. Try again in a moment.',
+      );
+    }
+
+    // Claim the gift's unspent balance so a concurrent redemption cannot also draw on it.
+    const claimed = await CommunityContributionModel.findOneAndUpdate(
+      { _id: contribution._id, remaining_cents: { $gte: refundable } },
+      { $inc: { remaining_cents: -refundable } },
+    ).exec();
+    if (!claimed) {
+      await CommunityFundModel.updateOne(
+        { business_id: contribution.business_id },
+        { $inc: { balance_cents: refundable } },
+      ).exec();
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'Part of this gift was just used. Reload to see what is left.',
+      );
+    }
+
+    let refundId: string;
+    try {
+      const res = await stripe().createRefund({
+        paymentIntentId: contribution.stripe_payment_intent_id,
+        amountCents: refundable,
+        idempotencyKey: `pf_refund_${contributionId}`,
+      });
+      refundId = res.refundId;
+    } catch (err) {
+      // The money never left. Put the pool and the gift back exactly as they were.
+      await CommunityFundModel.updateOne(
+        { business_id: contribution.business_id },
+        { $inc: { balance_cents: refundable } },
+      ).exec();
+      await CommunityContributionModel.updateOne(
+        { _id: contribution._id },
+        { $inc: { remaining_cents: refundable } },
+      ).exec();
+      logger.error({ err, contributionId }, 'Pay It Forward refund failed at the processor');
+      throw err;
+    }
+
+    await CommunityContributionModel.updateOne(
+      { _id: contribution._id },
+      {
+        $set: { refunded_at: new Date(), stripe_refund_id: refundId },
+        $inc: { refunded_cents: refundable },
+      },
+    ).exec();
+
+    await communityFundLedger.refund({
+      fund: { businessId: contribution.business_id },
+      amountCents: refundable,
+      refundId: String(contribution._id),
+      memo: `Giver took back ${formatCents(refundable)} within the 24-hour window`,
+    });
+
+    await invalidateAggregate(`pf:impact:${contribution.business_id}`);
+    await writeAudit({
+      actorId: principal.userId,
+      action: 'payforward.contribution_refunded',
+      entityType: 'community_fund',
+      entityId: contribution.business_id,
+      metadata: { contributionId, refundedCents: refundable, refundId },
+    });
+
+    return {
+      contributionId,
+      refundedCents: refundable,
+      /** What stayed spent, so the screen can say it rather than implying a partial failure. */
+      keptCents: contribution.amount_cents - refundable,
+    };
+  },
+
   // ─── Redemption (money out) ───────────────────────────────────────────────────────────────
   /**
    * How much the fund WOULD cover for this person on this order, with no side effects. Used by the
@@ -614,10 +770,27 @@ export const payforwardService = {
    * cheapest possible way to drain a pool. A person genuinely affected by this waits until
    * tomorrow, which is the same rule everyone else is under.
    */
-  async refundRedemptionForOrder(orderId: string): Promise<number> {
+  async refundRedemptionForOrder(
+    orderId: string,
+    opts: { freeDailySlot?: boolean; reason?: string } = {},
+  ): Promise<number> {
+    /**
+     * `refunded` keeps the person's daily slot; `released` frees it. The difference is whether the
+     * redemption HAPPENED. A cancelled order did happen and was unwound, so the slot stays used —
+     * otherwise order-cancel-redraw is the cheapest way to drain a pool. An ABANDONED checkout
+     * never happened at all: nobody was fed, and blocking someone's whole day because their
+     * connection dropped mid-payment is punishing them for our timeout.
+     */
+    const status = opts.freeDailySlot ? 'released' : 'refunded';
     const redemption = await CommunityRedemptionModel.findOneAndUpdate(
       { order_id: orderId, status: 'applied' },
-      { $set: { status: 'refunded', refunded_at: new Date() } },
+      {
+        $set: {
+          status,
+          refunded_at: new Date(),
+          ...(opts.reason ? { released_reason: opts.reason } : {}),
+        },
+      },
       { new: true },
     ).exec();
     if (!redemption) return 0; // no community money in this order, or already reversed
@@ -657,6 +830,80 @@ export const payforwardService = {
       metadata: { orderId, amountCents: amount, redemptionId: String(redemption._id) },
     });
     return amount;
+  },
+
+  /**
+   * ═══ Release community money held by a checkout nobody ever paid for. ═══
+   *
+   * The fund is committed when an order is PLACED — deliberately, so a declined card cannot leave
+   * the vendor short. But `release` only fires when the charge THROWS, and a customer who simply
+   * closes the payment sheet throws nothing. That order sits `pending` for ever, its transaction
+   * sits `pending` for ever, and the community money it reserved is consumed permanently: on a
+   * fully covered order no card was even charged, so there is nothing to decline and nothing to
+   * notice. A small pool could be emptied by people who wandered off.
+   *
+   * Bounded, idempotent, and deliberately conservative — it only touches orders still `pending`
+   * whose transaction has NOT completed. A paid order is never unwound by a timeout.
+   */
+  async releaseAbandonedCheckouts(limit = SWEEP_BATCH_LIMIT): Promise<{
+    checked: number;
+    released: number;
+  }> {
+    const cutoff = new Date(Date.now() - PAY_FORWARD_ABANDON_AFTER_MS);
+    const { OrderModel } = await import('../orders/orders.model');
+    const { TransactionModel } = await import('../payments/payments.model');
+
+    const stale = await OrderModel.find({
+      status: 'pending',
+      pay_it_forward_cents: { $gt: 0 },
+      created_at: { $lte: cutoff },
+    })
+      .sort({ created_at: 1 })
+      .limit(limit)
+      .lean()
+      .exec();
+
+    let released = 0;
+    for (const order of stale) {
+      const orderId = String(order._id);
+      try {
+        /**
+         * A partly covered order has a card charge. If it actually SETTLED, the customer paid and
+         * this is a live order the vendor simply has not accepted yet — never unwind that.
+         */
+        if (order.transaction_id) {
+          const txn = await TransactionModel.findById(order.transaction_id).lean().exec();
+          if (txn && txn.status !== 'pending') continue;
+        }
+
+        const amount = await this.refundRedemptionForOrder(orderId, {
+          freeDailySlot: true,
+          reason: 'checkout_abandoned',
+        });
+        if (!amount) continue;
+
+        /**
+         * Close the order too. Leaving it `pending` for ever would keep it on the vendor's screen
+         * as work to do, and on the customer's as an order that might still arrive.
+         */
+        await OrderModel.updateOne(
+          { _id: order._id, status: 'pending' },
+          { $set: { status: 'cancelled', cancelled_reason: 'Payment was not completed' } },
+        ).exec();
+
+        released += 1;
+        logger.info(
+          { orderId, amountCents: amount },
+          'released community money from an abandoned checkout',
+        );
+      } catch (err) {
+        // One bad order must not stop the rest of the pool being freed.
+        logger.error({ err, orderId }, 'could not release an abandoned Pay It Forward checkout');
+      }
+    }
+
+    reportSweepBatch('payforward-abandoned', stale.length);
+    return { checked: stale.length, released };
   },
 
   /**
@@ -763,7 +1010,12 @@ export const payforwardService = {
         {
           $group: {
             _id: null,
-            total: { $sum: '$amount_cents' },
+            /**
+             * Net of anything taken back in the §7 window. A gift of $20 whose giver reclaimed $14
+             * contributed $6 — the meal that $6 bought genuinely happened, so the row is not
+             * erased, but claiming the full $20 as community generosity would overstate it.
+             */
+            total: { $sum: { $subtract: ['$amount_cents', { $ifNull: ['$refunded_cents', 0] }] } },
             count: { $sum: 1 },
             max: { $max: '$amount_cents' },
           },
@@ -842,6 +1094,19 @@ export const payforwardService = {
       createdAt: r.created_at,
       expiresAt: r.expires_at ?? null,
       expiredAt: r.expired_at ?? null,
+      /**
+       * ADR-005 §7, answered HERE rather than re-derived on the screen. Whether a gift can still be
+       * taken back depends on when the money arrived and how much of it has since fed somebody —
+       * both facts the client cannot know, and a second copy of a money rule is how the two stop
+       * agreeing. The button is shown when this is positive, and the server re-checks anyway.
+       */
+      refundableCents:
+        r.status === 'succeeded' && !r.expired_at ? refundableNow(r.credited_at, r.remaining_cents) : 0,
+      refundableUntil:
+        r.status === 'succeeded' && r.credited_at
+          ? new Date(r.credited_at.getTime() + PAY_FORWARD_REFUND_WINDOW_MS)
+          : null,
+      refundedCents: r.refunded_cents ?? 0,
     }));
   },
 

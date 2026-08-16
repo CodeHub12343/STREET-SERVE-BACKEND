@@ -5,6 +5,7 @@ import {
   DEFAULT_CONSIGNMENT_FEE_BPS,
   RTO_PRE_RECOVERY_DAYS,
   RTO_PROHIBITED_CATEGORY_SLUGS,
+  RTO_RECONCILE_AFTER_MS,
   RTO_REMINDER_LEAD_DAYS,
   type RtoReminderStage,
 } from '../../config/constants';
@@ -1234,6 +1235,70 @@ export const rtoService = {
       clientSecret: charge.clientSecret ?? null,
       alreadyPaid: false,
     };
+  },
+
+  /**
+   * ═══ Rescue an agreement whose settling webhook never arrived. ═══
+   *
+   * Ownership, the immutable ledger, the consignment split and the ownership TRANSFER are all
+   * driven by `payment_intent.succeeded` — which is the right design, and which makes a lost
+   * webhook expensive in a way it never was before. The failure modes:
+   *
+   *  • an ACCEPTANCE settles at Stripe and the event is dropped → the customer has paid their
+   *    deposit, owns nothing, and their instalment schedule stays frozen by the sweep guard;
+   *  • a PAYOFF settles and the event is dropped → they have paid off the item in full and the
+   *    system still says it is not theirs;
+   *  • a CARD SETUP completes and the event is dropped → no saved card, so every instalment on the
+   *    agreement is uncollectable.
+   *
+   * All three are silent: the customer's money is gone and nothing on any screen changes. Stripe is
+   * authoritative here, so this asks what actually happened rather than trusting our own row, and
+   * moves nothing forward unless Stripe says the money is there. Idempotent by construction — it
+   * reuses the webhook handlers, which no-op on anything no longer pending.
+   */
+  async reconcilePendingIntents(limit = SWEEP_BATCH_LIMIT): Promise<{
+    checked: number;
+    settled: number;
+  }> {
+    const cutoff = new Date(Date.now() - RTO_RECONCILE_AFTER_MS);
+    const { RtoAgreementModel } = await import('./rto.model');
+    const stuck = await RtoAgreementModel.find({
+      pending_intent_ref: { $ne: null },
+      updated_at: { $lte: cutoff },
+    })
+      .sort({ updated_at: 1 })
+      .limit(limit)
+      .lean()
+      .exec();
+
+    let settled = 0;
+    for (const a of stuck) {
+      const ref = String(a.pending_intent_ref);
+      const agreementId = String(a._id);
+      try {
+        if (a.pending_intent_kind === 'card_setup') {
+          const intent = await stripe().retrieveSetupIntent(ref);
+          if (intent.status !== 'succeeded') continue;
+          const res = await this.attachCardBySetupIntent(ref);
+          if (res.handled) settled += 1;
+        } else {
+          const intent = await stripe().retrievePaymentIntent(ref);
+          if (intent.status !== 'succeeded') continue;
+          const res = await this.creditByPaymentIntent(ref);
+          if (res.handled) settled += 1;
+        }
+        logger.warn(
+          { agreementId, intentRef: ref, kind: a.pending_intent_kind },
+          'settled a paid Rent-to-Own agreement whose webhook never arrived — check webhook delivery',
+        );
+      } catch (err) {
+        // One unreadable intent must not stop the others being rescued.
+        logger.error({ err, agreementId }, 'could not reconcile a Rent-to-Own payment');
+      }
+    }
+
+    reportSweepBatch('rto-reconcile', stuck.length);
+    return { checked: stuck.length, settled };
   },
 
   /**

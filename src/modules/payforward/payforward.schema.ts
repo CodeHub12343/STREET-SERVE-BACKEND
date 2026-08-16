@@ -9,6 +9,8 @@ import {
 const objectId = z.string().length(24);
 
 export const BusinessIdParam = z.object({ businessId: objectId }).strict();
+/** ADR-005 §7 — the gift being taken back. Ownership is checked in the service. */
+export const ContributionIdParam = z.object({ contributionId: objectId }).strict();
 
 export const ContributeBody = z
   .object({

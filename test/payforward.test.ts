@@ -4,7 +4,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app';
 import { setStripeGateway } from '../src/integrations/stripe';
 import { CategoryModel } from '../src/modules/catalog/catalog.model';
-import { ConnectedAccountModel } from '../src/modules/payments/payments.model';
+import { ConnectedAccountModel, TransactionModel } from '../src/modules/payments/payments.model';
 import { OrderModel } from '../src/modules/orders/orders.model';
 import { communityFundLedger } from '../src/modules/ledger/communityFund';
 import { ledgerService } from '../src/modules/ledger/ledger.service';
@@ -135,6 +135,15 @@ async function contributeAndSettle(
       }),
     );
   return res;
+}
+
+/** Place an order. Module-scoped: the refund and abandonment tests need it too. */
+function placeOrder(token: string, body: object, key: string) {
+  return request(app)
+    .post('/api/v1/orders')
+    .set(...bearer(token))
+    .set('Idempotency-Key', key)
+    .send(body);
 }
 
 // ─── 3a · contribution ──────────────────────────────────────────────────────────────────────
@@ -373,6 +382,127 @@ describe('3a · a pool rises only when money actually arrives', () => {
     expect(amounts).not.toContain(2200);
   });
 
+  /**
+   * ═══ ADR-005 §7 — the change-of-mind window. ═══
+   *
+   * It existed on paper and nowhere else: the ledger leg was written and correct, but only Boost
+   * ever called it, so a gift was final the instant it settled. Someone who mistyped $200 for $20
+   * had no way back except a support ticket.
+   */
+  it('lets a giver take back the UNSPENT part of a gift within 24 hours', async () => {
+    const v = await vendorWithMenu('pf-takeback');
+    const giver = await customer('pf-takeback-give');
+    const buyer = await customer('pf-takeback-buy');
+    const res = await contributeAndSettle(giver, v.businessId, 5000, 'pf_takeback_1');
+    const contributionId = res.body.data.contributionId as string;
+
+    // Someone eats. That part of the gift is gone in the only sense that matters.
+    await placeOrder(
+      buyer,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'pf_takeback_order',
+    );
+    const spent = 5000 - (await CommunityFundModel.findOne({ business_id: v.businessId }).lean())!
+      .balance_cents;
+    expect(spent).toBeGreaterThan(0);
+
+    const refund = await request(app)
+      .post(`/api/v1/pay-it-forward/contributions/${contributionId}/refund`)
+      .set(...bearer(giver))
+      .set('Idempotency-Key', 'pf_takeback_refund')
+      .send({});
+    expect(refund.status).toBe(200);
+
+    // Only the remainder comes back; the meal that already happened stays bought.
+    expect(refund.body.data.refundedCents).toBe(5000 - spent);
+    expect(refund.body.data.keptCents).toBe(spent);
+    expect(
+      (await CommunityFundModel.findOne({ business_id: v.businessId }).lean())!.balance_cents,
+    ).toBe(0);
+
+    const row = await CommunityContributionModel.findById(contributionId).lean();
+    expect(row!.remaining_cents).toBe(0);
+    expect(row!.refunded_cents).toBe(5000 - spent);
+    // NOT flipped to a failed/refunded status — the $spent it bought genuinely happened.
+    expect(row!.status).toBe('succeeded');
+
+    // And the impact figure nets it out rather than claiming the full $50 as generosity.
+    const impact = await payforwardService.computeImpact(v.businessId);
+    expect(impact.contributedCents).toBe(spent);
+  });
+
+  it('refuses once the whole gift has reached someone', async () => {
+    const v = await vendorWithMenu('pf-allspent');
+    const giver = await customer('pf-allspent-give');
+    const buyer = await customer('pf-allspent-buy');
+    // Small enough that one order consumes all of it.
+    const res = await contributeAndSettle(giver, v.businessId, 300, 'pf_allspent_1');
+    const contributionId = res.body.data.contributionId as string;
+
+    await placeOrder(
+      buyer,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'pf_allspent_order',
+    );
+    expect(
+      (await CommunityContributionModel.findById(contributionId).lean())!.remaining_cents,
+    ).toBe(0);
+
+    const refund = await request(app)
+      .post(`/api/v1/pay-it-forward/contributions/${contributionId}/refund`)
+      .set(...bearer(giver))
+      .set('Idempotency-Key', 'pf_allspent_refund')
+      .send({});
+    expect([400, 422]).toContain(refund.status);
+    // Named precisely: their money did exactly what they intended.
+    expect(JSON.stringify(refund.body)).toMatch(/already gone to someone/i);
+  });
+
+  it('closes the window after 24 hours', async () => {
+    const v = await vendorWithMenu('pf-toolate');
+    const giver = await customer('pf-toolate-give');
+    const res = await contributeAndSettle(giver, v.businessId, 1000, 'pf_toolate_1');
+    const contributionId = res.body.data.contributionId as string;
+
+    await CommunityContributionModel.updateOne(
+      { _id: contributionId },
+      { $set: { credited_at: new Date(Date.now() - 25 * 3_600_000) } },
+    );
+
+    const refund = await request(app)
+      .post(`/api/v1/pay-it-forward/contributions/${contributionId}/refund`)
+      .set(...bearer(giver))
+      .set('Idempotency-Key', 'pf_toolate_refund')
+      .send({});
+    expect([400, 422]).toContain(refund.status);
+    expect(JSON.stringify(refund.body)).toMatch(/24-hour window/i);
+  });
+
+  it("will not let one person take back another's gift", async () => {
+    const v = await vendorWithMenu('pf-notyours');
+    const giver = await customer('pf-notyours-give');
+    const stranger = await customer('pf-notyours-other');
+    const res = await contributeAndSettle(giver, v.businessId, 1000, 'pf_notyours_1');
+
+    const refund = await request(app)
+      .post(`/api/v1/pay-it-forward/contributions/${res.body.data.contributionId}/refund`)
+      .set(...bearer(stranger))
+      .set('Idempotency-Key', 'pf_notyours_refund')
+      .send({});
+    expect([403, 404]).toContain(refund.status);
+    expect(
+      (await CommunityFundModel.findOne({ business_id: v.businessId }).lean())!.balance_cents,
+    ).toBe(1000);
+  });
+
   it('is anonymous unless the giver opts out, and never leaks the contributor id', async () => {
     const v = await vendorWithMenu('pf-anon');
     const shy = await customer('pf-anon-shy');
@@ -431,14 +561,6 @@ describe('3a · a pool rises only when money actually arrives', () => {
 
 // ─── 3b · redemption ────────────────────────────────────────────────────────────────────────
 describe('3b · redemption, caps and the daily limit', () => {
-  function placeOrder(token: string, body: object, key: string) {
-    return request(app)
-      .post('/api/v1/orders')
-      .set(...bearer(token))
-      .set('Idempotency-Key', key)
-      .send(body);
-  }
-
   it('offers the fund at quote time without reserving anything', async () => {
     const v = await vendorWithMenu('pf-quote');
     const giver = await customer('pf-quote-give');
@@ -774,6 +896,104 @@ describe('3b · redemption, caps and the daily limit', () => {
     });
     expect(again.amountCents).toBe(0);
     expect(again.reason).toBe('daily_limit');
+  });
+
+  /**
+   * ═══ A checkout nobody paid for must not hold the pool hostage. ═══
+   *
+   * The fund is committed when the order is PLACED — deliberately, so a declined card cannot leave
+   * the vendor short. But `release` only fires when the charge THROWS, and a customer who simply
+   * closes the payment sheet throws nothing. On a fully covered order no card is even charged, so
+   * there is nothing to decline and nothing to notice: the money was consumed permanently and a
+   * small pool could be emptied by people who wandered off.
+   */
+  it('releases community money from a checkout that was never paid for', async () => {
+    const v = await vendorWithMenu('pf-abandon');
+    const giver = await customer('pf-abandon-give');
+    const buyer = await customer('pf-abandon-buy');
+    await contributeAndSettle(giver, v.businessId, 5000, 'pf_abandon_1');
+
+    const res = await placeOrder(
+      buyer,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'pf_abandon_order',
+    );
+    const orderId = res.body.data.id as string;
+    const covered = (await OrderModel.findById(orderId).lean())!.pay_it_forward_cents;
+    expect(covered).toBeGreaterThan(0);
+
+    // The customer walks away. Age the order past the abandon window.
+    await OrderModel.collection.updateOne(
+      { _id: (await OrderModel.findById(orderId).lean())!._id },
+      { $set: { created_at: new Date(Date.now() - 60 * 60_000) } },
+    );
+
+    const swept = await payforwardService.releaseAbandonedCheckouts();
+    expect(swept.released).toBeGreaterThanOrEqual(1);
+
+    // Money back in the pool, and the order no longer sits on the vendor's screen for ever.
+    expect(
+      (await CommunityFundModel.findOne({ business_id: v.businessId }).lean())!.balance_cents,
+    ).toBe(5000);
+    expect((await OrderModel.findById(orderId).lean())!.status).toBe('cancelled');
+
+    /**
+     * The daily slot IS freed here, unlike a cancellation. Nothing happened to this person — nobody
+     * was fed — and blocking their whole day because their connection dropped mid-payment would be
+     * punishing them for our timeout.
+     */
+    const redemption = await CommunityRedemptionModel.findOne({ order_id: orderId }).lean();
+    expect(redemption!.status).toBe('released');
+    const again = await payforwardService.reserve({
+      businessId: v.businessId,
+      userId: (await OrderModel.findById(orderId).lean())!.customer_id,
+      userTier: 'bronze',
+      coverableCents: 2000,
+    });
+    expect(again.amountCents).toBeGreaterThan(0);
+  });
+
+  /** A paid order must never be unwound by a timeout. */
+  it('leaves a settled order alone however long the vendor takes to accept it', async () => {
+    const v = await vendorWithMenu('pf-abandon-paid');
+    const giver = await customer('pf-abandon-paid-give');
+    const buyer = await customer('pf-abandon-paid-buy');
+    // Small gift so the order is only PARTLY covered and a real card charge exists.
+    await contributeAndSettle(giver, v.businessId, 300, 'pf_abandon_paid_1');
+
+    const res = await placeOrder(
+      buyer,
+      {
+        businessId: v.businessId,
+        items: [{ menuItemId: v.menuItemId, quantity: 1 }],
+        usePayItForward: true,
+      },
+      'pf_abandon_paid_order',
+    );
+    const orderId = res.body.data.id as string;
+    const order = await OrderModel.findById(orderId).lean();
+    expect(order!.transaction_id).toEqual(expect.any(String));
+
+    // The customer DID pay; the vendor simply has not accepted yet.
+    await TransactionModel.updateOne(
+      { _id: order!.transaction_id },
+      { $set: { status: 'completed' } },
+    );
+    await OrderModel.collection.updateOne(
+      { _id: order!._id },
+      { $set: { created_at: new Date(Date.now() - 60 * 60_000) } },
+    );
+
+    await payforwardService.releaseAbandonedCheckouts();
+
+    expect((await OrderModel.findById(orderId).lean())!.status).toBe('pending');
+    expect(
+      (await CommunityRedemptionModel.findOne({ order_id: orderId }).lean())!.status,
+    ).toBe('applied');
   });
 
   it('is opt-in: an order that does not ask for help does not get any', async () => {

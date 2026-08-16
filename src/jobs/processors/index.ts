@@ -231,6 +231,16 @@ export function startWorkers(redis: Redis): Worker[] {
           if (n) logger.info({ expired: n }, 'payforward-expiry sweep');
           break;
         }
+        case 'payforward-abandoned': {
+          const r = await payforwardService.releaseAbandonedCheckouts();
+          if (r.released) logger.info({ ...r }, 'payforward-abandoned sweep');
+          break;
+        }
+        case 'rto-reconcile': {
+          const r = await rtoService.reconcilePendingIntents();
+          if (r.settled) logger.warn({ ...r }, 'rto-reconcile settled missed webhooks');
+          break;
+        }
         case 'payforward-reconcile': {
           const r = await payforwardService.reconcilePendingContributions();
           if (r.credited || r.failed) {
