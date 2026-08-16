@@ -371,6 +371,60 @@ export const livemapService = {
       ).map((u) => String(u._id)),
     );
 
+    /**
+     * ═══ A seller pin needs a NAME. ═══
+     *
+     * A seller has no business behind them, so `name` was left null on their pin and shipped that
+     * way to the client. Nothing had ever noticed, because until street sellers could go live no
+     * seller pin could exist — the moment they could, `Avatar` called `.trim()` on null during
+     * render and React escalated it to the route boundary, taking out the whole /map page.
+     *
+     * `Avatar` is hardened separately, because a missing name must never be a page-level crash. But
+     * the real fix is here: send the name we have.
+     */
+    const sellerNames = new Map<string, { name: string | null; photoUrl: string | null }>();
+    if (sellerIds.length > 0) {
+      const sellerUsers = await UserModel.find(
+        { _id: { $in: sellerIds } },
+        { display_name: 1, photo_url: 1 },
+      )
+        .lean()
+        .exec();
+      for (const u of sellerUsers) {
+        sellerNames.set(String(u._id), {
+          name: u.display_name ?? null,
+          photoUrl: u.photo_url ?? null,
+        });
+      }
+    }
+
+    /**
+     * ═══ A seller pin needs a NAME. ═══
+     *
+     * A seller has no business behind them, so `name` was left null on their pin and sent that way.
+     * Nothing had ever noticed, because until street sellers could go live no seller pin could
+     * exist — the moment they could, `Avatar` called `.trim()` on null DURING RENDER and React
+     * escalated it to the route boundary, taking out the whole /map page.
+     *
+     * `Avatar` is hardened separately, because a missing name must never be a page-level crash. The
+     * real fix is here: send the name we actually have.
+     */
+    const sellerNames = new Map<string, { name: string | null; photoUrl: string | null }>();
+    if (sellerIds.length > 0) {
+      const sellerUsers = await UserModel.find(
+        { _id: { $in: sellerIds } },
+        { display_name: 1, photo_url: 1 },
+      )
+        .lean()
+        .exec();
+      for (const u of sellerUsers) {
+        sellerNames.set(String(u._id), {
+          name: u.display_name ?? null,
+          photoUrl: u.photo_url ?? null,
+        });
+      }
+    }
+
     const bmap = new Map(
       businesses.filter((b) => !blockedUserIds.has(b.owner_user_id)).map((b) => [String(b._id), b]),
     );
@@ -429,7 +483,13 @@ export const livemapService = {
       } else if (blockedUserIds.has(s.actor_id)) {
         continue; // seller pin whose own account is suspended or deleted
       } else if (categoryIds || searchLc) {
-        continue; // sellers have no business/category/name to match a filter against
+        continue; // sellers have no business/category to match a filter against
+      } else {
+        // A street seller. Named from their own profile; "Street seller" when they have set no
+        // display name, because a pin a customer cannot refer to is barely a pin at all.
+        const u = sellerNames.get(s.actor_id);
+        name = u?.name ?? 'Street seller';
+        logoUrl = u?.photoUrl ?? null;
       }
       const [lng, lat] = coordsOf(s);
       const coords =
