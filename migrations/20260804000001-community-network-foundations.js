@@ -40,10 +40,21 @@ module.exports = {
       .collection('fee_schedule')
       .updateOne({ version: 1 }, { $set: { ...NEW_FEES, updated_fees_at: now } });
 
-    // Default-deny in data as well as in code. `$set` on a nested key leaves other flags untouched.
-    await db
-      .collection('cities')
-      .updateMany({}, { $set: { 'feature_flags.delivery': false, updated_at: now } });
+    /**
+     * SUPERSEDED — deliberately left as a no-op rather than deleted.
+     *
+     * This used to write `feature_flags.delivery: false` onto every city, mirroring a code gate that
+     * was default-DENY at the time. That product decision has since been reversed: delivery is open
+     * everywhere unless a city is explicitly closed, and `isFeatureExplicitlyDisabled` reads exactly
+     * the `false` this wrote. So on any database where these migrations run fresh — a new
+     * environment, a rebuilt staging box — this line would silently switch delivery OFF for the
+     * entire platform, and the only visible symptom would be customers unable to choose delivery
+     * anywhere, with nothing in the logs to explain it.
+     *
+     * The statement is removed rather than the migration, because the file has already run on
+     * production and is recorded in `migrations_changelog`. Deleting or renumbering it would put the
+     * changelog and the directory out of step. Closing a city is now an explicit admin action.
+     */
   },
 
   async down(db) {
