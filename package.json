@@ -25,6 +25,7 @@
     "migrate:down": "migrate-mongo down -f migrate-mongo-config.js",
     "migrate:status": "migrate-mongo status -f migrate-mongo-config.js",
     "seed": "tsx scripts/seed.ts",
+    "grant-role": "tsx scripts/grant-role.ts",
     "seed:dev": "tsx scripts/seed-dev.ts",
     "audit:deps": "node scripts/check-vulnerabilities.mjs",
     "probe:print": "tsx scripts/print-vendor-probe.ts",
