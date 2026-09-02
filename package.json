@@ -27,6 +27,7 @@
     "seed": "tsx scripts/seed.ts",
     "grant-role": "tsx scripts/grant-role.ts",
     "audit:stripe": "tsx scripts/audit-stripe-accounts.ts",
+    "launch:check": "tsx scripts/launch-check.ts",
     "seed:dev": "tsx scripts/seed-dev.ts",
     "audit:deps": "node scripts/check-vulnerabilities.mjs",
     "probe:print": "tsx scripts/print-vendor-probe.ts",
