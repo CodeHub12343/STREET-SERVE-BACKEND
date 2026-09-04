@@ -1,4 +1,5 @@
 import { logger } from '../../config/logger';
+import { env } from '../../config/env';
 
 /**
  * 7.1 / A-9 / D-8 — the outbound transactional channel (email + SMS).
@@ -141,4 +142,35 @@ export async function sendOutbound(message: OutboundMessage): Promise<DeliveryOu
   }
 
   return outcomes;
+}
+
+/**
+ * ═══ Mail addressed to StreetServe itself. ═══
+ *
+ * `sendOutbound` reaches a **user**. This reaches the **operator** — the inbox a person actually
+ * watches — and it is a genuinely different destination with different rules:
+ *
+ *  • It goes to `OPS_EMAIL`, one configured address, never a user's.
+ *  • It is best-effort. Nothing contractual depends on it, so unlike a notice it is not recorded
+ *    in the delivery log and a failure is logged rather than surfaced. An operator alert that
+ *    could roll back a sponsorship purchase would be worse than a missed alert.
+ *  • It is never used for anything a user is owed. Consignment expiry, RTO reminders and
+ *    completion notices are addressed to the person they concern; sending those here instead
+ *    would mean the user was not notified at all.
+ *
+ * Until a provider adapter is installed, the default logging provider records these rather than
+ * sending them — visible in the logs as `provider: log`, not silently dropped.
+ */
+export async function notifyOps(
+  subject: string,
+  body: string,
+  idempotencyKey: string,
+): Promise<boolean> {
+  try {
+    await provider.sendEmail(env.OPS_EMAIL, subject, body, `${idempotencyKey}:ops`);
+    return true;
+  } catch (err) {
+    logger.error({ err, key: idempotencyKey, subject }, 'ops notification email failed');
+    return false;
+  }
 }

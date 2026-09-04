@@ -5,6 +5,7 @@ import { logger } from '../../config/logger';
 import { formatCents } from '../../shared/money';
 import { notificationsService } from '../notifications/notifications.service';
 import { stripe } from '../../integrations/stripe';
+import { notifyOps } from '../../integrations/messaging';
 import { paymentsService } from '../payments/payments.service';
 import { writeAudit } from '../../shared/audit';
 import { ERROR_CODES } from '../../shared/errors/codes';
@@ -147,6 +148,25 @@ export const sponsorsService = {
       entityId: sponsorId,
       metadata: { paymentIntentId, paidCents },
     });
+    /**
+     * Tell the operator, because at this point a paid sponsorship is blocked on a person. The
+     * sponsor has been promised their logo is checked by hand and refunded if refused; that
+     * promise is only as good as somebody knowing there is something to check. Best-effort and
+     * deliberately after the audit write — a mail failure must not undo a recorded payment.
+     */
+    void notifyOps(
+      `Sponsorship paid — logo awaiting review (${claimed.name})`,
+      [
+        `${claimed.name} has paid ${formatCents(paidCents)} for a ${claimed.term_months ?? 1}-month ${claimed.tier} placement.`,
+        claimed.logo_url ? `Logo: ${claimed.logo_url}` : 'No logo supplied — this will run as a text lockup.',
+        claimed.contact_email ? `Contact: ${claimed.contact_email}` : '',
+        '',
+        'It is NOT live. Approve or reject it in the admin sponsors screen; a rejection refunds in full.',
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      `sponsor_paid_${sponsorId}`,
+    );
     return { handled: true };
   },
 
@@ -542,6 +562,25 @@ export const sponsorsService = {
         utm_code: dto.utmCode ?? null,
         sponsor_id: sponsorId,
       });
+      /**
+       * The public site's only contact channel that reaches a database rather than a mail client.
+       * A lead that lands solely in a collection nobody queries is a lead nobody answers, so the
+       * operator inbox gets it too. Best-effort: a mail failure must not fail the sign-up.
+       */
+      void notifyOps(
+        `New StreetServe pre-registration — ${dto.fullName}`,
+        [
+          `Name: ${dto.fullName}`,
+          `Email: ${dto.email}`,
+          dto.phone ? `Phone: ${dto.phone}` : '',
+          `Interested as: ${dto.intendedRole ?? 'customer'}`,
+          dto.citySlug ? `City: ${dto.citySlug}` : '',
+          sponsorId ? `Attributed to sponsor: ${sponsorId}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        `prereg_${String(prereg._id)}`,
+      );
       return { id: String(prereg._id), attributedToSponsor: Boolean(sponsorId) };
     } catch (err) {
       if ((err as { code?: number }).code === 11000) {

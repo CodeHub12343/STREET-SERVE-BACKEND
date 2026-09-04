@@ -203,6 +203,18 @@ const EnvSchema = z.object({
     .transform((v) => v === 'true'),
 
   DEFAULT_CITY: z.string().default('modesto-ca'),
+
+  /**
+   * The operator inbox: where StreetServe's own mail lands — public contact enquiries and the
+   * system-generated notifications addressed to the platform rather than to a user (a sponsorship
+   * awaiting logo review, a new pre-registration).
+   *
+   * This is deliberately NOT where user notices go. A consignment expiry or an RTO payment
+   * reminder is addressed to the person it concerns and must keep going to them; redirecting those
+   * here would break the contractual-notice guarantee `notices.service` exists to uphold. See
+   * `notifyOps` in integrations/messaging.
+   */
+  OPS_EMAIL: z.string().email().default('jbowser727@gmail.com'),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
