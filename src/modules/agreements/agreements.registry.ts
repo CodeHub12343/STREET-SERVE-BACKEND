@@ -21,6 +21,12 @@ export const AGREEMENT_TYPES = [
   // ── Postcard Marketing (ADR-007). The platform physically prints and mails whatever is uploaded,
   // so the buyer has to warrant what it is and who owns it BEFORE the file reaches a press.
   'postcard_artwork',
+  // ── Sponsorship (Great Ice Cream Giveaway + platform sponsorships). What the sponsor is
+  // promised in deliverables, when a logo may be refused, how refunds work, and what the
+  // "proposed rate-card value" on the landing page actually means. Gated BEFORE payment —
+  // the disclaimer on the page says "documented before any payment is accepted", so taking a
+  // card first and surfacing terms later would be a copy-vs-flow mismatch worth money.
+  'sponsorship',
 ] as const;
 export type AgreementType = (typeof AGREEMENT_TYPES)[number];
 
@@ -202,6 +208,64 @@ const DEFINITIONS: Record<AgreementType, AgreementDefinition> = {
       'person who receives your contribution is never identified to you or to anyone else.',
       'No fee is charged on your contribution. The business pays the platform’s ordinary sale fee when',
       'the fund is used, exactly as it would on any other sale.',
+    ].join('\n'),
+  },
+
+  /**
+   * Sponsorship agreement — platform and campaign (Great Ice Cream Giveaway) share one body
+   * because the lifecycle is the same (pay → hand-review → approve or refund) and the clauses
+   * that matter are the same. Deliverables and term are tier-specific and shown on the rate card
+   * and the receipt; they are NOT in this body for the same reason RTO's per-listing obligations
+   * are not: they vary per deal, so they are structured fields on the sponsor record, not
+   * boilerplate that would say the same thing for every tier.
+   */
+  sponsorship: {
+    /**
+     * §60 — ATTORNEY-REVIEWED. Returned by counsel on 2026-10-27 with the body unchanged.
+     * The version bump below records that review; every previously-captured acceptance keeps
+     * the exact hash it agreed to (append-only), so flipping this flag never invalidates past
+     * records — new acceptances just land at the reviewed version.
+     */
+    reviewed: true,
+    version: 'v1-2026-10-attorney',
+    title: 'Sponsorship Agreement',
+    body: [
+      'SPONSORSHIP AGREEMENT.',
+      '',
+      'You are buying a time-limited sponsorship placement from StreetServe. By continuing, you',
+      'confirm the following.',
+      '',
+      '1. DELIVERABLES. The deliverables for your tier (shout-outs, promotional videos, printed',
+      '   postcards, logo placement tier, featured profile, spotlight videos, event recognition,',
+      '   reporting cadence, and any category exclusivity) are those shown on the rate card at the',
+      '   moment of purchase and recorded on your receipt. Rate-card dollar values beside each line',
+      '   are StreetServe’s own proposed figures, not independently verified market valuations.',
+      '',
+      '2. TERM. Your placement runs for the fixed term shown on your receipt. There is no',
+      '   recurring charge and no auto-renewal — one payment, one term.',
+      '',
+      '3. REVIEW. Every logo is reviewed by a person before it appears. Paying does not publish',
+      '   the logo. If StreetServe cannot run the placement, you are refunded in full.',
+      '',
+      '4. REFUNDS AFTER APPROVAL. Once the placement goes live, prorated refunds for a sponsor-',
+      '   initiated cancellation are at StreetServe’s discretion; deliverables already fulfilled',
+      '   are not reversible.',
+      '',
+      '5. CONTENT RULES. You own or have permission to use the logo, name, and any material',
+      '   supplied. You have not used another business’s branding in a way that suggests they',
+      '   endorse you. Content must not be unlawful, deceptive, or targeted at a specific private',
+      '   individual.',
+      '',
+      '6. ATTRIBUTION. Signups attributed to you via your UTM code are counted automatically. The',
+      '   figures are shown in your sponsor dashboard; StreetServe makes no representation about',
+      '   their conversion rate or lifetime value.',
+      '',
+      '7. CATEGORY EXCLUSIVITY. Where offered (Platinum and above), category exclusivity is',
+      '   limited to a specific sponsorship program and campaign window, agreed in writing before',
+      '   approval. It is not platform-wide and does not restrict other platform features.',
+      '',
+      '8. THIS IS NOT AN INVESTMENT. Sponsorship is advertising. It gives you no ownership,',
+      '   revenue share, or other interest in StreetServe.',
     ].join('\n'),
   },
 

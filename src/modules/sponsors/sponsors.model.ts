@@ -1,5 +1,6 @@
 import { Schema, type InferSchemaType } from 'mongoose';
 
+import { DEFAULT_SPONSOR_PROGRAM, SPONSOR_PROGRAMS } from '../../config/constants';
 import { defineModel } from '../../shared/defineModel';
 
 /**
@@ -11,6 +12,32 @@ const SponsorSchema = new Schema(
     name: { type: String, required: true },
     logo_url: { type: String, default: null },
     tier: { type: String, default: 'launch' },
+    /**
+     * Which sponsorship program this record belongs to. Existing rows have no value and resolve
+     * to `platform` on read — the backfill is implicit, so no migration is needed. See
+     * `SPONSOR_PROGRAMS` for the full list and why program is a field, not a separate collection.
+     */
+    program: {
+      type: String,
+      enum: SPONSOR_PROGRAMS,
+      default: DEFAULT_SPONSOR_PROGRAM,
+      index: true,
+    },
+    /**
+     * Public profile fields — the "featured sponsor profile" line on the Gold/Platinum/Diamond
+     * rate cards. These are OPTIONAL and OWNER-WRITABLE post-approval: a sponsor can land here
+     * with just a logo and fill in the profile later. Profile rendering gates on tier server-side
+     * (see `getPublicProfile`), so a Silver sponsor adding a `website_url` does not accidentally
+     * appear in the Gold+ directory.
+     */
+    website_url: { type: String, default: null },
+    about: { type: String, default: null, maxlength: 500 },
+    /**
+     * The URL slug for the public profile. Human-readable (`clean-air-plumbing`), unique, and
+     * independent of the UTM code so the sponsor can rename without breaking the UTM link. Set
+     * on creation from the sponsor's name; a collision falls back to appending the utm suffix.
+     */
+    slug: { type: String, default: null, unique: true, sparse: true, index: true },
     launch_city_slug: { type: String, default: null },
     utm_code: { type: String, required: true, unique: true },
     /**

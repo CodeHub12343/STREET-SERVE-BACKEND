@@ -66,6 +66,22 @@ taxRouter.get(
 );
 
 /**
+ * Franchise Phase 5 — the signed-in operator's annual summary of direct transfers from
+ * per_operator brand splits. Scoped to the authenticated user; no admin override.
+ */
+taxRouter.get(
+  '/statements/operator',
+  rateLimit('read'),
+  authenticate,
+  requirePermission('tax:read_own'),
+  validate({ query: StatementQuery }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = query<z.infer<typeof StatementQuery>>(req);
+    ok(res, await taxStatementsService.operatorStatement(principal(req), q.year));
+  }),
+);
+
+/**
  * Marketplace-facilitator remittance. Finance-only: this is the number filed with a state, and
  * recording a remittance discharges a real liability.
  */

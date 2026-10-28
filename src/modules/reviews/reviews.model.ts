@@ -14,6 +14,22 @@ const ReviewSchema = new Schema(
     rating: { type: Number, required: true, min: 1, max: 5 },
     comment: { type: String, default: null },
     /**
+     * ═══ FRANCHISE / MULTI-VENDOR — Phase 4 brand aggregation. ═══
+     *
+     * The brand that owns the business this review was written against. Set at review-creation
+     * time (and backfilled by Phase 4 migration for existing rows). The map pin + profile pin
+     * read the brand's aggregate rating — so a Platinum sponsor with two trucks shows ONE 4.6★
+     * number across both, not two separate scores one truck lower.
+     *
+     * `operator_id` is the per-operator CALLOUT — optional, set when the reviewer wants to
+     * specifically acknowledge or complain about a particular truck's service. Does NOT change
+     * which truck earned the rating (that's still subject_id = business_id). The field exists
+     * so a filtered view "see what customers said about the Oakland truck specifically" is
+     * possible without re-indexing on write.
+     */
+    brand_id: { type: String, default: null, index: true },
+    operator_id: { type: String, default: null },
+    /**
      * CU-30 — photos on a review. A photo of the actual plate is the most useful thing a review can
      * carry for a food business, and the least fakeable.
      */
@@ -43,6 +59,7 @@ const ReviewSchema = new Schema(
 );
 ReviewSchema.index({ subject_type: 1, subject_id: 1, created_at: -1 });
 ReviewSchema.index({ transaction_id: 1 }, { unique: true }); // one review per transaction
+ReviewSchema.index({ brand_id: 1, created_at: -1 }); // brand-level aggregation reads this
 
 export type ReviewDoc = InferSchemaType<typeof ReviewSchema>;
 export const ReviewModel = defineModel('Review', ReviewSchema);

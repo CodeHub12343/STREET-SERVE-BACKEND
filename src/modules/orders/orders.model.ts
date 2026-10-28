@@ -105,6 +105,14 @@ const OrderSchema = new Schema(
      * `apply` is what writes the order id onto it, and `apply` is precisely what is being deferred.
      */
     pay_it_forward_redemption_id: { type: String, default: null },
+    /**
+     * PIF-II — the specific-item contribution this order is claiming. Non-null means the
+     * order is reserving a queued item at this business; commit on payment success, release on
+     * failure. Decoupled from `pay_it_forward_redemption_id` because the pool and the item
+     * live in different collections — one is `CommunityRedemption`, the other is
+     * `CommunityItemContribution` — and conflating them would break the commit path.
+     */
+    pif_item_contribution_id: { type: String, default: null },
     tip_cents: { type: Number, default: 0 },
     round_up_cents: { type: Number, default: 0 },
     total_cents: { type: Number, required: true },

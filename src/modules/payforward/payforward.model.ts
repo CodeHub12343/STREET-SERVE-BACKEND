@@ -53,6 +53,24 @@ const CommunityFundSchema = new Schema(
       enum: PAY_FORWARD_EXPIRY_DAY_OPTIONS,
       default: PAY_FORWARD_DEFAULT_EXPIRY_DAYS,
     },
+
+    /**
+     * ═══ PIF-II (ADR-005 §9) — SPECIFIC-ITEM contributions ("suspended coffee"). ═══
+     *
+     * The pool pays for ANY item a redeemer picks; this flag enables the parallel path where a
+     * contributor BUYS a specific menu item in advance and leaves it for the next eligible
+     * customer to claim. Separate from `accepting` because a vendor might want pool money (easy
+     * to administer) but not specific items (which require real inventory availability at
+     * claim time), or vice-versa.
+     */
+    accepting_items: { type: Boolean, default: true },
+    /**
+     * Ceiling on how many FUNDED-but-unclaimed items may queue up for this business at once.
+     * Null = uncapped. The number matters because an unlimited queue invites a vendor's menu
+     * being gamed — a flood of cheap items pre-bought on a sale day costs the vendor the
+     * inventory the next customer walks in expecting.
+     */
+    max_items_waiting: { type: Number, default: null, min: 1 },
   },
   {
     timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' },
@@ -187,4 +205,101 @@ export type CommunityRedemptionDoc = InferSchemaType<typeof CommunityRedemptionS
 export const CommunityRedemptionModel = defineModel(
   'CommunityRedemption',
   CommunityRedemptionSchema,
+);
+
+// ─── community_item_contributions — specific item earmarked for the next claimer ────────────
+/**
+ * ═══ PIF-II SPECIFIC-ITEM CONTRIBUTION ("suspended coffee") ═══
+ *
+ * The parallel path to the pool: a contributor BUYS a specific menu item in advance
+ * (snapshotted name + price at purchase time), the row sits `funded`, and the next eligible
+ * customer picks it from the business profile to redeem on their order.
+ *
+ * Why NOT reuse `CommunityContribution`:
+ *
+ *   • A pool contribution is cash, FIFO-consumed and partially spendable. An item is one
+ *     indivisible claim — a $6 item used on an $8 order does NOT turn into $2 leftover.
+ *   • A pool contribution covers any item a redeemer picks; an item contribution covers
+ *     exactly the item it names, so the redemption surface is "claim this specific item" not
+ *     "credit at checkout".
+ *   • Expiry semantics differ. A dormant pool dollar is unclaimed property in some states; a
+ *     dormant item is physical inventory the vendor would otherwise have sold, so the vendor
+ *     gets to decide (via `expiry_days`) and the money refunds to the giver on expiry rather
+ *     than redistributing.
+ *
+ * **Snapshot pricing is deliberate.** `price_cents_at_purchase` is the price the contributor
+ * paid; it does NOT re-resolve to the menu item's current price at claim time. A customer
+ * who gave at $5 and comes back to find the item is $7 did not short the next recipient — the
+ * contributor pre-paid for a specific instance of that item.
+ *
+ * Lifecycle:
+ *   pending → funded (webhook) → reserved → claimed (order succeeds)
+ *                                        → released (card failed; back to funded)
+ *                            → refunded (giver change-of-mind, before claim)
+ *                            → expired  (sweep; refunded to giver)
+ */
+const CommunityItemContributionSchema = new Schema(
+  {
+    business_id: { type: String, required: true, index: true },
+    menu_item_id: { type: String, required: true, index: true },
+    /** Snapshotted so a later price change doesn't retroactively alter the claim. */
+    menu_item_name_at_purchase: { type: String, required: true },
+    price_cents_at_purchase: { type: Number, required: true, min: 1 },
+
+    contributor_id: { type: String, required: true, index: true },
+    anonymous: { type: Boolean, default: true },
+    display_name: { type: String, default: null },
+    note: { type: String, default: null, maxlength: 280 },
+
+    stripe_payment_intent_id: { type: String, required: true, unique: true },
+
+    status: {
+      type: String,
+      enum: ['pending', 'funded', 'reserved', 'claimed', 'released', 'refunded', 'expired'],
+      default: 'pending',
+      index: true,
+    },
+
+    /** Set when the webhook claims the pending intent. Credits the item to the queue. */
+    funded_at: { type: Date, default: null },
+
+    /** Set when a redeemer reserves it on an order. The reservation blocks other reservers. */
+    reserved_by_user_id: { type: String, default: null },
+    reserved_order_id: { type: String, default: null },
+    reserved_at: { type: Date, default: null },
+
+    /** Set when the order's payment succeeds. Terminal. */
+    claimed_by_user_id: { type: String, default: null },
+    claimed_order_id: { type: String, default: null },
+    claimed_at: { type: Date, default: null },
+
+    /** Change-of-mind refund (giver, within 24h) or auto-refund on expiry. */
+    refunded_at: { type: Date, default: null },
+    refunded_cents: { type: Number, default: 0 },
+    stripe_refund_id: { type: String, default: null },
+
+    /** Set when the webhook creates the row; expired at this moment if still funded. */
+    expires_at: { type: Date, required: true, index: true },
+    expired_at: { type: Date, default: null },
+    expiry_notice_sent: { type: Boolean, default: false },
+  },
+  {
+    timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' },
+    collection: 'community_item_contributions',
+  },
+);
+/**
+ * The hot query: "funded items on this business's queue, oldest first". FIFO so a contributor
+ * waiting longest is honoured first and the expiry sweep walks oldest-first.
+ */
+CommunityItemContributionSchema.index({ business_id: 1, status: 1, funded_at: 1 });
+/** Reservation uniqueness: a row can be reserved by at most one order at a time (enforced by
+ *  the state transition — only `funded` → `reserved` is allowed — but the index helps the
+ *  reserver pick an available row atomically). */
+CommunityItemContributionSchema.index({ status: 1, expires_at: 1 });
+
+export type CommunityItemContributionDoc = InferSchemaType<typeof CommunityItemContributionSchema>;
+export const CommunityItemContributionModel = defineModel(
+  'CommunityItemContribution',
+  CommunityItemContributionSchema,
 );

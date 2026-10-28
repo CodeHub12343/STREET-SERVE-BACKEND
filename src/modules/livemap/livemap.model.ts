@@ -21,8 +21,18 @@ const LiveSessionSchema = new Schema(
      * **Drivers are excluded from customer-facing map queries at the repository layer** — see
      * `nearby()`. A driver is not a vendor; rendering idle drivers as discoverable pins would be
      * both a privacy problem and a confusing map.
+     *
+     * `operator` is the franchise Phase 1 addition — one truck of a multi-truck brand. For single
+     * -owner profiles that have not been franchised, `business` is still the right actor_type and
+     * nothing changes. An `operator` session's `actor_id` points at a `BrandOperator` row (not
+     * at a Business), so the one-pin-per-actor invariant stays true: two operators of the same
+     * brand are two different actors with two different sessions.
      */
-    actor_type: { type: String, enum: ['business', 'seller', 'driver'], required: true },
+    actor_type: {
+      type: String,
+      enum: ['business', 'seller', 'driver', 'operator'],
+      required: true,
+    },
     actor_id: { type: String, required: true },
     current_location: {
       type: { type: String, enum: ['Point'], required: true },
@@ -69,13 +79,43 @@ export type LocationPingDoc = InferSchemaType<typeof LocationPingSchema>;
 export const LocationPingModel = defineModel('LocationPing', LocationPingSchema);
 
 // ─── follows (persistent) ──────────────────────────────────────────────────────────────────
+/**
+ * ═══ FRANCHISE / MULTI-VENDOR — Phase 4 brand-aware follow. ═══
+ *
+ * Historically keyed to `business_id`; a customer following "James's Ice Cream" would only hear
+ * from the one truck they first bumped into. In Phase 4 the SAME row carries a `brand_id`, and
+ * the live-notification path reads brand_id in preference to business_id. For single-truck
+ * brands this is behaviour-identical: follow-business-X and follow-brand-Y resolve to the same
+ * single truck.
+ *
+ * The row still carries `business_id` because:
+ *   • Pre-franchise code still writes follows keyed to business_id. Keeping the field lets
+ *     migration + reads stay backwards-compatible.
+ *   • Analytics and discovery queries that reason about a specific truck's follower count still
+ *     work on `business_id`.
+ *
+ * The uniqueness invariant is now "one follow per (follower, brand)" when brand_id is set, OR
+ * "one follow per (follower, business)" for pre-migration rows. Enforced by two partial unique
+ * indexes.
+ */
 const FollowSchema = new Schema(
   {
     follower_user_id: { type: String, required: true },
     business_id: { type: String, required: true },
+    /** Set by Phase 4 writes + the backfill script. Null for untouched legacy rows. */
+    brand_id: { type: String, default: null, index: true },
   },
   { timestamps: { createdAt: 'created_at', updatedAt: false }, collection: 'follows' },
 );
+/**
+ * Brand-level uniqueness — Phase 4 default. A customer following the same brand twice (via two
+ * different trucks) collapses to one row.
+ */
+FollowSchema.index(
+  { follower_user_id: 1, brand_id: 1 },
+  { unique: true, partialFilterExpression: { brand_id: { $type: 'string' } } },
+);
+/** Legacy business-level uniqueness — survives the backfill window for unmigrated rows. */
 FollowSchema.index({ follower_user_id: 1, business_id: 1 }, { unique: true });
 FollowSchema.index({ business_id: 1 });
 

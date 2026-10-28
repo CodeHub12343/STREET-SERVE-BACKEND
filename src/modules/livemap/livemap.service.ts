@@ -23,6 +23,7 @@ import { distanceMeters, geohashEncode } from '../../shared/geo';
 import { kv } from '../../shared/kv';
 import type { Principal } from '../../shared/types/principal';
 import { agreementsService } from '../agreements/agreements.service';
+import { brandOperatorService } from '../brands/brandOperator.service';
 import { CategoryModel } from '../catalog/catalog.model';
 import { UserModel } from '../identity/identity.model';
 import { notificationsService } from '../notifications/notifications.service';
@@ -35,7 +36,7 @@ import { vendorsService } from '../vendors/vendors.service';
 import { liveStore } from './liveStore';
 import { livemapRepository as repo } from './livemap.repository';
 
-type ActorType = 'business' | 'seller' | 'driver';
+type ActorType = 'business' | 'seller' | 'driver' | 'operator';
 type LiveStatus = 'driving' | 'parked' | 'away_closed';
 
 /** A session shape usable from both hydrated docs and lean results. */
@@ -82,6 +83,17 @@ async function assertActorControl(
     if (owner !== principal.userId) {
       throw ForbiddenError('You do not own this business', ERROR_CODES.NOT_OWNER);
     }
+    return;
+  }
+  if (actorType === 'operator') {
+    /**
+     * An operator session is controlled by exactly ONE user — the person at the wheel of that
+     * truck, recorded on the `BrandOperator` row. A brand owner cannot "take over" a session
+     * their operator is running; that would both overwrite the operator's own live pin and
+     * silently claim their position as the owner's. If owners want to go live themselves they
+     * create their own operator row.
+     */
+    await brandOperatorService.assertControl(principal.userId, actorId);
     return;
   }
   const role = actorType === 'driver' ? 'driver' : 'seller';
@@ -149,6 +161,24 @@ export const livemapService = {
       }
       // Vendor Terms of Sale must be accepted once before selling (R28). Checked after license so a
       // regulated vendor still sees LICENSE_REQUIRED first (unchanged behavior).
+      await agreementsService.assertAccepted(principal.userId, 'regular_sale');
+    }
+    if (input.actorType === 'operator') {
+      /**
+       * An operator inherits the owning business's licence state — the licence is per-business
+       * (ice cream = regulated food category), not per-operator. If James's Ice Cream has an
+       * approved licence, both trucks may go live under it; if the licence lapses, neither can.
+       * `assertControl` above has already verified the operator exists and belongs to this user.
+       */
+      const op = await brandOperatorService.resolveForPin(input.actorId);
+      if (!op) throw NotFoundError('Operator not found');
+      const licensed = await vendorsService.isBusinessLicensedForLiveOps(op.businessId);
+      if (!licensed) {
+        throw BusinessRuleError(
+          ERROR_CODES.LICENSE_REQUIRED,
+          'This category requires an approved license before going live',
+        );
+      }
       await agreementsService.assertAccepted(principal.userId, 'regular_sale');
     }
     if (
@@ -247,17 +277,32 @@ export const livemapService = {
       realtime.pinUpdate(session.geohash, this.pinPayload(updated, session.fuzz_radius_m));
     }
 
-    // Away/Closed → active again: fulfill Notify-Me and alert followers (business actors).
-    if (
-      session.actor_type === 'business' &&
-      prevStatus === 'away_closed' &&
-      status !== 'away_closed'
-    ) {
-      await this.onBusinessBecameActive(session.actor_id, status);
+    // Away/Closed → active again: fulfill Notify-Me and alert followers.
+    //
+    // Franchise Phase 4: operator sessions also fire this, scoped to the operator's underlying
+    // business. A follower of a brand hears when ANY truck goes active, which is exactly what
+    // the deduped follower list in `onBusinessBecameActive` resolves.
+    if (prevStatus === 'away_closed' && status !== 'away_closed') {
+      if (session.actor_type === 'business') {
+        await this.onBusinessBecameActive(session.actor_id, status);
+      } else if (session.actor_type === 'operator') {
+        const op = await brandOperatorService.resolveForPin(session.actor_id);
+        if (op) await this.onBusinessBecameActive(op.businessId, status);
+      }
     }
     // Pop-Up Mode: a driving→parked transition with an active queue notifies waiting customers.
     // A driver has no queue and no customers waiting on their pitch, so this never applies to one.
-    if (prevStatus === 'driving' && status === 'parked' && session.actor_type !== 'driver') {
+    //
+    // Phase 1 scoping: operator sessions do NOT fire Pop-Up yet because queueService keys on
+    // (actor_type, actor_id) and the queue is at the business level — an operator's `actor_id`
+    // is a brand_operator id, not a business id. Phase 4 widens queue scoping so a brand's queue
+    // is notified when any of its operators arrives at a pitch.
+    if (
+      prevStatus === 'driving' &&
+      status === 'parked' &&
+      session.actor_type !== 'driver' &&
+      session.actor_type !== 'operator'
+    ) {
       await queueService.notifyActiveQueueDelay(session.actor_type, session.actor_id, 'popup');
     }
     await publish('live_session.status_changed', { sessionId, status });
@@ -269,8 +314,9 @@ export const livemapService = {
     const session = await repo.findSessionById(sessionId);
     if (!session || session.ended_at) throw NotFoundError('No active session');
     await assertActorControl(principal, session.actor_type, session.actor_id);
-    if (session.actor_type === 'driver') {
-      // Pop-Up is a vendor mechanic — it tells a queue their truck has arrived. A driver has neither.
+    if (session.actor_type === 'driver' || session.actor_type === 'operator') {
+      // Pop-Up is a vendor mechanic — it tells a queue their truck has arrived. A driver has
+      // no queue; an operator's queue scoping lands in Phase 4 (see onBusinessBecameActive).
       throw ForbiddenError('Pop-Up is for vendors', ERROR_CODES.NOT_OWNER);
     }
     const notified = await queueService.notifyActiveQueueDelay(
@@ -353,10 +399,57 @@ export const livemapService = {
       limit: input.limit,
     });
 
-    const businessIds = sessions.filter((s) => s.actor_type === 'business').map((s) => s.actor_id);
+    /**
+     * ═══ Phase 1 — resolve operator pins to their brand + home business. ═══
+     *
+     * An operator session's `actor_id` is a `BrandOperator` id, not a business id. Resolving in
+     * bulk (one $in per collection) means the hottest path on the map pays O(1) round trips
+     * regardless of how many operators are in viewport. Resolved operators are then folded in
+     * as if their home business were a business pin, so category filters, modules, verified
+     * badges, and discount lookups all work exactly as they do for a single-owner business.
+     */
+    const operatorIds = sessions.filter((s) => s.actor_type === 'operator').map((s) => s.actor_id);
+    const operatorMap = await brandOperatorService.resolveBulkForPins(operatorIds);
+    const operatorBusinessIds = [...operatorMap.values()].map((o) => o.businessId);
+
+    const businessIds = [
+      ...new Set([
+        ...sessions.filter((s) => s.actor_type === 'business').map((s) => s.actor_id),
+        ...operatorBusinessIds,
+      ]),
+    ];
     const businesses = await BusinessModel.find({ _id: { $in: businessIds }, status: 'active' })
       .lean()
       .exec();
+
+    /**
+     * Business → brand resolution. Even a single-truck business carries a `brand_id` after
+     * Phase 0's backfill; we fetch brand metadata here so the frontend can render a brand chip
+     * on EVERY pin (consistency), not only on multi-truck brands. The query is batched.
+     */
+    const brandIdsFromBusinesses = businesses
+      .map((b) => (b.brand_id ? String(b.brand_id) : null))
+      .filter((v): v is string => Boolean(v));
+    const brandIdsFromOperators = [...operatorMap.values()].map((o) => o.brandId);
+    const brandIds = [...new Set([...brandIdsFromBusinesses, ...brandIdsFromOperators])];
+    const { BrandModel } = await import('../brands/brands.model');
+    const brands =
+      brandIds.length === 0
+        ? []
+        : await BrandModel.find({ _id: { $in: brandIds }, status: 'active' }).lean().exec();
+    const brandByBusiness = new Map<string, { brandId: string; brandName: string; brandLogoUrl: string | null }>();
+    const brandById = new Map(
+      brands.map((b) => [
+        String(b._id),
+        { brandId: String(b._id), brandName: b.name, brandLogoUrl: b.logo_url ?? null },
+      ]),
+    );
+    for (const b of businesses) {
+      if (b.brand_id) {
+        const brand = brandById.get(String(b.brand_id));
+        if (brand) brandByBusiness.set(String(b._id), brand);
+      }
+    }
 
     // A pin originates in live_sessions, which carries no reference to the owning account. Without
     // this join a suspended/deleted owner keeps rendering — and taking bookings — until their
@@ -441,6 +534,13 @@ export const livemapService = {
       let logoUrl: string | null = null;
       let categoryId: string | null = null;
       let modules: string[] | null = null;
+      /** The underlying business for discount / verified / modules — one business per pin. */
+      let backingBusinessId: string | null = null;
+      let brand: { brandId: string; brandName: string; brandLogoUrl: string | null } | null = null;
+      /** Operator-specific identity so a truck can be addressed as "North truck". Null for business pins. */
+      let operatorId: string | null = null;
+      let operatorDisplayName: string | null = null;
+
       if (s.actor_type === 'business') {
         const b = bmap.get(s.actor_id);
         if (!b) continue;
@@ -453,6 +553,43 @@ export const livemapService = {
           business: b,
           category: catMap.get(categoryId) ?? null,
         }).enabled;
+        backingBusinessId = s.actor_id;
+        brand = brandByBusiness.get(s.actor_id) ?? null;
+      } else if (s.actor_type === 'operator') {
+        /**
+         * Operator pin — resolve to the home business for category/modules/discount, and keep
+         * the operator's own display_name and brand metadata on the pin. The pin reads as "North
+         * truck · James's Ice Cream" rather than as a nameless duplicate.
+         *
+         * A retired operator (resolveBulkForPins returned no row) is dropped silently — the pin
+         * disappears, same behaviour as a suspended seller account.
+         */
+        const op = operatorMap.get(s.actor_id);
+        if (!op) continue;
+        const b = bmap.get(op.businessId);
+        if (!b) continue;
+        if (blockedUserIds.has(b.owner_user_id)) continue;
+        categoryId = String(b.category_id);
+        if (categoryIds && !categoryIds.includes(categoryId)) continue;
+        /** Search matches EITHER the brand name or the truck display name — a customer looking for
+         *  "James" should find both trucks. */
+        if (
+          searchLc &&
+          !op.brandName.toLowerCase().includes(searchLc) &&
+          !op.displayName.toLowerCase().includes(searchLc) &&
+          !b.name.toLowerCase().includes(searchLc)
+        )
+          continue;
+        name = op.displayName;
+        logoUrl = op.brandLogoUrl ?? b.logo_url ?? null;
+        modules = resolveModulesFrom({
+          business: b,
+          category: catMap.get(categoryId) ?? null,
+        }).enabled;
+        backingBusinessId = op.businessId;
+        brand = { brandId: op.brandId, brandName: op.brandName, brandLogoUrl: op.brandLogoUrl };
+        operatorId = op.operatorId;
+        operatorDisplayName = op.displayName;
       } else if (blockedUserIds.has(s.actor_id)) {
         continue; // seller pin whose own account is suspended or deleted
       } else if (categoryIds || searchLc) {
@@ -476,7 +613,7 @@ export const livemapService = {
         categoryId,
         modules,
         status: s.status,
-        /** P-19 — rendered on the pin and the profile; false for sellers, who have no plan. */
+        /** P-19 — rendered on the pin and the profile; false for sellers/operators, who have no plan of their own. */
         verified: s.actor_type === 'business' && verifiedSet.has(s.actor_id),
         /**
          * P-11 — a live arrival estimate for a business on the move. A customer watching a truck
@@ -485,11 +622,24 @@ export const livemapService = {
          */
         etaMinutes: etaMinutesFor(s.status, coords as [number, number], input.lng, input.lat),
         /**
-         * Business-wide flash sale percent, or 0. Sellers have no menu and therefore no sale.
-         * Item-scoped sales are deliberately excluded upstream — see liveDiscountByBusiness.
+         * Business-wide flash sale percent, or 0. Resolved on the backing business so a brand's
+         * discount reaches every one of its operator pins without duplicating the record.
+         * Sellers have no menu and therefore no sale.
          */
-        discountPercent:
-          s.actor_type === 'business' ? (discountByBusiness.get(s.actor_id) ?? 0) : 0,
+        discountPercent: backingBusinessId
+          ? (discountByBusiness.get(backingBusinessId) ?? 0)
+          : 0,
+        /**
+         * Phase 1 — brand metadata for the frontend chip. Null for a seller (they have no brand);
+         * set for every business/operator pin after Phase 0's backfill. The frontend renders the
+         * chip when `brand` is present and uses `brand.brandName` as the "owner" label.
+         */
+        brand,
+        /** Operator-specific identity. Null for business/seller pins. */
+        operatorId,
+        operatorDisplayName,
+        /** The backing business id — single destination for Order, Menu, Profile actions. */
+        businessId: backingBusinessId,
         location: { type: 'Point', coordinates: coords },
       });
     }
@@ -585,13 +735,27 @@ export const livemapService = {
 
   // ─── Follow / Notify-Me ─────────────────────────────────────────────────────────────────
   async follow(principal: Principal, businessId: string) {
-    const owner = await vendorsService.getBusinessOwner(businessId);
-    if (!owner) throw NotFoundError('Business not found');
-    await repo.createFollow(principal.userId, businessId);
+    /**
+     * Franchise Phase 4: resolve the business → brand so a follow against a specific truck is
+     * stored at the brand level. The customer thinks they're following the brand ("James's Ice
+     * Cream"), and the brand follow is what fires when any of its trucks goes live.
+     */
+    const business = await BusinessModel.findById(businessId)
+      .select('owner_user_id brand_id')
+      .lean()
+      .exec();
+    if (!business) throw NotFoundError('Business not found');
+    const brandId = business.brand_id ? String(business.brand_id) : null;
+    await repo.createFollow(principal.userId, businessId, brandId);
     return { following: true };
   },
   async unfollow(principal: Principal, businessId: string) {
-    await repo.removeFollow(principal.userId, businessId);
+    const business = await BusinessModel.findById(businessId)
+      .select('brand_id')
+      .lean()
+      .exec();
+    const brandId = business?.brand_id ? String(business.brand_id) : null;
+    await repo.removeFollow(principal.userId, businessId, brandId);
     return { following: false };
   },
   async listFavorites(principal: Principal) {
@@ -701,13 +865,45 @@ export const livemapService = {
       });
     })();
 
-    const followers = await repo.listFollowersOf(businessId);
+    /**
+     * Franchise Phase 4: resolve the owning brand so a follower of the WHOLE brand hears about
+     * any of its trucks going live. For brand-less businesses this is a no-op — the follower
+     * list falls back to the legacy `business_id` query. The brand lookup is one additional
+     * read; de-duping by follower_user_id makes the notification set the user sees stable (one
+     * ping per go-live event, even if they followed the brand and the specific truck separately).
+     */
+    const businessForBrand = await BusinessModel.findById(businessId)
+      .select('brand_id name')
+      .lean()
+      .exec();
+    const brandId = businessForBrand?.brand_id ? String(businessForBrand.brand_id) : null;
+    let brandName: string | null = null;
+    if (brandId) {
+      const { BrandModel } = await import('../brands/brands.model');
+      const brand = await BrandModel.findById(brandId).select('name').lean().exec();
+      brandName = brand?.name ?? null;
+    }
+
+    const followers = await repo.listFollowersOf(businessId, brandId);
+    const seenFollowers = new Set<string>();
     for (const f of followers) {
+      if (seenFollowers.has(f.follower_user_id)) continue;
+      seenFollowers.add(f.follower_user_id);
+      /**
+       * Copy differentiates brand-scoped vs business-scoped follows: a brand follower hears
+       * "James's Ice Cream — a truck is now active" (so the business name on the pin they
+       * actually tap is their own cue), whereas a legacy single-truck follower hears the exact
+       * truck name. The data payload carries both so the client's tap-handler can decide.
+       */
+      const isBrandFollow = Boolean(f.brand_id);
       notificationsService.notify(f.follower_user_id, {
         category: 'follow_status',
-        title: 'A followed business is now active',
+        title:
+          isBrandFollow && brandName
+            ? `${brandName} — a truck is now active`
+            : 'A followed business is now active',
         body: status === 'driving' ? 'Now Driving nearby' : 'Now Parked and open',
-        data: { businessId },
+        data: { businessId, brandId },
       });
     }
     await repo.fulfillNotifyMe(businessId);

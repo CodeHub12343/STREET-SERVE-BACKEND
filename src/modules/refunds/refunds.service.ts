@@ -1,6 +1,7 @@
 import { logger } from '../../config/logger';
 import { publish } from '../../events/bus';
 import { writeAudit } from '../../shared/audit';
+import { isOwnerSync } from '../../shared/businessAccess';
 import { formatCents } from '../../shared/money';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import {
@@ -61,7 +62,7 @@ export const refundsService = {
 
     // Either party to the sale may refund it, plus admins.
     const isSeller = checkout.seller_id === principal.userId;
-    const isHubOwner = hub?.owner_user_id === principal.userId;
+    const isHubOwner = Boolean(hub && isOwnerSync(principal.userId, hub));
     const isAdmin = principal.roles.includes('admin');
     if (!isSeller && !isHubOwner && !isAdmin) {
       throw ForbiddenError('Not a participant in this sale', ERROR_CODES.NOT_PARTICIPANT);
@@ -287,7 +288,7 @@ export const refundsService = {
   async listForHub(principal: Principal, hubId: string) {
     const hub = await consignmentRepo.findHubById(hubId);
     if (!hub) throw NotFoundError('Hub not found');
-    if (hub.owner_user_id !== principal.userId) {
+    if (!isOwnerSync(principal.userId, hub)) {
       throw ForbiddenError('You do not own this hub', ERROR_CODES.NOT_OWNER);
     }
     const checkouts = await consignmentRepo.listCheckoutsByHub(hubId);

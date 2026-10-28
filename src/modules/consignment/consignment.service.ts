@@ -33,6 +33,7 @@ import {
 import { logger } from '../../config/logger';
 import { publish } from '../../events/bus';
 import { writeAudit } from '../../shared/audit';
+import { isOwnerSync } from '../../shared/businessAccess';
 import { formatCents } from '../../shared/money';
 import { distanceMeters } from '../../shared/geo';
 import { raiseFraudFlag } from '../../shared/fraud';
@@ -125,7 +126,7 @@ async function assertCategoryPermittedInJurisdiction(
 async function assertHubOwner(principal: Principal, hubId: string) {
   const hub = await repo.findHubById(hubId);
   if (!hub) throw NotFoundError('Hub not found');
-  if (hub.owner_user_id !== principal.userId) {
+  if (!isOwnerSync(principal.userId, hub)) {
     throw ForbiddenError('You do not own this hub', ERROR_CODES.NOT_OWNER);
   }
   return hub;
@@ -852,7 +853,7 @@ export const consignmentService = {
   async getApprovalPolicy(principal: Principal, hubId: string) {
     const hub = await repo.findHubById(hubId);
     if (!hub) throw NotFoundError('Hub not found');
-    if (hub.owner_user_id !== principal.userId)
+    if (!isOwnerSync(principal.userId, hub))
       throw ForbiddenError('You do not own this hub', ERROR_CODES.NOT_OWNER);
     return {
       autoApproveMinTrust: hub.auto_approve_min_trust ?? DEFAULT_AUTO_APPROVE_MIN_TRUST,
@@ -1379,7 +1380,7 @@ export const consignmentService = {
     if (!checkout) throw NotFoundError('Checkout not found');
     const hub = await repo.findHubById(checkout.hub_id);
     const isSeller = checkout.seller_id === principal.userId;
-    const isHubOwner = hub?.owner_user_id === principal.userId;
+    const isHubOwner = Boolean(hub && isOwnerSync(principal.userId, hub));
     if (!isSeller && !isHubOwner)
       throw ForbiddenError('Not a participant', ERROR_CODES.NOT_PARTICIPANT);
     const settlement = await repo.findSettlementByCheckout(checkoutId);
@@ -1840,7 +1841,7 @@ export const consignmentService = {
 
     const isSeller = checkout.seller_id === principal.userId;
     const hub = await repo.findHubById(checkout.hub_id);
-    const isHubOwner = hub?.owner_user_id === principal.userId;
+    const isHubOwner = Boolean(hub && isOwnerSync(principal.userId, hub));
     if (!isSeller && !isHubOwner) {
       throw ForbiddenError(
         'Only the seller or the hub that owns this inventory can end the consignment',
@@ -1926,7 +1927,7 @@ export const consignmentService = {
     if (!checkout) throw NotFoundError('Checkout not found');
     const isSeller = checkout.seller_id === principal.userId;
     const hub = await repo.findHubById(checkout.hub_id);
-    const isHubOwner = hub?.owner_user_id === principal.userId;
+    const isHubOwner = Boolean(hub && isOwnerSync(principal.userId, hub));
     if (!isSeller && !isHubOwner) {
       throw ForbiddenError('Not a party to this consignment', ERROR_CODES.NOT_OWNER);
     }
@@ -1982,7 +1983,7 @@ export const consignmentService = {
     const checkout = await repo.findCheckoutById(checkoutId);
     if (!checkout) throw NotFoundError('Checkout not found');
     const hub = await repo.findHubById(checkout.hub_id);
-    if (hub?.owner_user_id !== principal.userId) {
+    if (!hub || !isOwnerSync(principal.userId, hub)) {
       throw ForbiddenError('Only the hub can change the commission', ERROR_CODES.NOT_OWNER);
     }
     if ((checkout.quantity_sold ?? 0) > 0) {

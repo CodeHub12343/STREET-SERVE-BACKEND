@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 
+import { SPONSOR_PROGRAMS } from '../../config/constants';
 import { authenticate } from '../../middleware/auth';
 import { asyncHandler } from '../../middleware/asyncHandler';
 import { idempotency } from '../../middleware/idempotency';
@@ -10,6 +11,10 @@ import { body, params, validate } from '../../middleware/validate';
 import { created, ok } from '../../shared/respond';
 import { UnauthenticatedError } from '../../shared/errors/AppError';
 import { sponsorsService } from './sponsors.service';
+
+const ProgramQuery = z
+  .object({ program: z.enum(SPONSOR_PROGRAMS).optional() })
+  .strict();
 
 function principal(req: Request) {
   if (!req.principal) throw UnauthenticatedError();
@@ -22,8 +27,10 @@ export const sponsorsPublicRouter = Router();
 sponsorsPublicRouter.get(
   '/',
   rateLimit('read'),
-  asyncHandler(async (_req: Request, res: Response) => {
-    ok(res, await sponsorsService.listActive());
+  validate({ query: ProgramQuery }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = req.query as z.infer<typeof ProgramQuery>;
+    ok(res, await sponsorsService.listActive(q.program ?? null));
   }),
 );
 
@@ -40,14 +47,69 @@ sponsorsPublicRouter.post(
   }),
 );
 
-/** The public rate card. Priced in code, so a sponsor and the server never disagree on the price. */
+/**
+ * The public rate card. Priced in code, so a sponsor and the server never disagree on the price.
+ * Program-aware: `?program=ice_cream_giveaway` returns the Great Ice Cream Giveaway packages;
+ * no param returns the platform tiers (default).
+ */
 sponsorsPublicRouter.get(
   '/tiers',
   rateLimit('read'),
-  asyncHandler(async (_req: Request, res: Response) => {
-    ok(res, sponsorsService.listTiers());
+  validate({ query: ProgramQuery }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = req.query as z.infer<typeof ProgramQuery>;
+    ok(res, sponsorsService.listTiers(q.program ?? null));
   }),
 );
+
+/**
+ * The signed-in sponsor's reach + attribution — the figures the campaign dashboard shows next to
+ * fulfilment counts. Separate from `/me/fulfillment` because the fulfilment tracker only exists
+ * for approved sponsors with countable deliverables, whereas reach stats apply to EVERY active
+ * sponsorship (including platform logo-only placements).
+ */
+sponsorsPublicRouter.get(
+  '/me/stats',
+  rateLimit('read'),
+  authenticate,
+  asyncHandler(async (req: Request, res: Response) => {
+    const stats = await sponsorsService.getOwnStats(principal(req));
+    ok(res, stats ?? { empty: true });
+  }),
+);
+
+/**
+ * Owner self-service — the fields a sponsor can change about their own public profile. Narrow
+ * on purpose: tier, logo, slug, and status stay admin-controlled.
+ */
+const OwnProfileBody = z
+  .object({
+    websiteUrl: z.string().url().max(2048).nullable().optional(),
+    about: z.string().max(500).nullable().optional(),
+  })
+  .strict();
+sponsorsPublicRouter.patch(
+  '/me/profile',
+  rateLimit('write'),
+  authenticate,
+  validate({ body: OwnProfileBody }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(
+      res,
+      await sponsorsService.updateOwnProfile(
+        principal(req),
+        body<z.infer<typeof OwnProfileBody>>(req),
+      ),
+    );
+  }),
+);
+
+/**
+ * Public sponsor profile — resolved by slug or UTM code. The service hard-gates on tier, so a
+ * Silver sponsor's URL returns 404 even if they set profile fields. Placed AFTER `/tiers`,
+ * `/me/*`, and `/impression` so it does not shadow them.
+ */
+const SlugParam = z.object({ slug: z.string().min(1).max(80) }).strict();
 
 /**
  * Buy a placement. Opens a Stripe charge and returns its client secret — it publishes NOTHING.
@@ -59,10 +121,16 @@ const PurchaseBody = z
   .object({
     name: z.string().min(1).max(160),
     tier: z.string().min(1).max(40),
+    /**
+     * Platform sponsorships are priced monthly, so a term is required; giveaway packages are a
+     * one-time price with a fixed 90-day window, so any value is accepted and ignored by the
+     * server. The schema stays permissive here and the service picks the right branch.
+     */
     termMonths: z.number().int().min(1).max(24),
     logoUrl: z.string().url().max(2048).optional(),
     contactEmail: z.string().email(),
     launchCitySlug: z.string().max(64).optional(),
+    program: z.enum(SPONSOR_PROGRAMS).optional(),
   })
   .strict();
 sponsorsPublicRouter.post(
@@ -79,6 +147,22 @@ sponsorsPublicRouter.post(
         body<z.infer<typeof PurchaseBody>>(req),
         req.header('Idempotency-Key') ?? '',
       ),
+    );
+  }),
+);
+
+/**
+ * Mounted last on the public router so it does NOT shadow `/tiers`, `/me/stats`, `/me/profile`,
+ * `/me/fulfillment`, `/impression`, or `/purchase` above.
+ */
+sponsorsPublicRouter.get(
+  '/:slug',
+  rateLimit('read'),
+  validate({ params: SlugParam }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(
+      res,
+      await sponsorsService.getPublicProfile(params<z.infer<typeof SlugParam>>(req).slug),
     );
   }),
 );
@@ -120,6 +204,7 @@ const CreateSponsorBody = z
     utmCode: z.string().min(1).max(64),
     logoUrl: z.string().url().max(2048).optional(),
     tier: z.string().max(40).optional(),
+    program: z.enum(SPONSOR_PROGRAMS).optional(),
     launchCitySlug: z.string().max(64).optional(),
     /** Recorded by hand. Nothing is collected — see the model. */
     contractedCents: z.number().int().min(0).max(100_000_000).optional(),
@@ -131,6 +216,7 @@ const UpdateSponsorBody = z
     name: z.string().min(1).max(160).optional(),
     logoUrl: z.string().url().max(2048).nullable().optional(),
     tier: z.string().max(40).optional(),
+    program: z.enum(SPONSOR_PROGRAMS).optional(),
     launchCitySlug: z.string().max(64).nullable().optional(),
     contractedCents: z.number().int().min(0).max(100_000_000).optional(),
     note: z.string().max(500).nullable().optional(),
@@ -163,8 +249,10 @@ sponsorsAdminRouter.get(
   rateLimit('read'),
   authenticate,
   requirePermission('admin:manage_sponsors'),
-  asyncHandler(async (_req: Request, res: Response) => {
-    ok(res, await sponsorsService.listAll());
+  validate({ query: ProgramQuery }),
+  asyncHandler(async (req: Request, res: Response) => {
+    const q = req.query as z.infer<typeof ProgramQuery>;
+    ok(res, await sponsorsService.listAll(q.program ? { program: q.program } : {}));
   }),
 );
 

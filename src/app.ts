@@ -77,6 +77,16 @@ import {
   sponsorsAdminRouter,
   sponsorsPublicRouter,
 } from './modules/sponsors/sponsors.routes';
+import {
+  sponsorFulfillmentAdminRouter,
+  sponsorFulfillmentPublicRouter,
+} from './modules/sponsorFulfillment/sponsorFulfillment.routes';
+import {
+  brandInvitePublicRouter,
+  brandOperatorPrivateRouter,
+  brandsAdminRouter,
+  brandsPublicRouter,
+} from './modules/brands/brands.routes';
 import { authWebhookRouter } from './webhooks/auth.webhook';
 import { stripeWebhookRouter } from './webhooks/stripe.webhook';
 import { kycWebhookRouter } from './webhooks/kyc.webhook';
@@ -209,8 +219,14 @@ export function createApp(): Express {
   api.use('/users', backofficeRouter);
   api.use('/config', platformRouter);
   api.use('/sponsors', sponsorsPublicRouter);
+  api.use('/sponsors', sponsorFulfillmentPublicRouter); // GET /sponsors/me/fulfillment
   api.use('/preregistrations', preregistrationsRouter);
   api.use('/admin', sponsorsAdminRouter);
+  api.use('/admin', sponsorFulfillmentAdminRouter); // GET + POST /admin/sponsors/:id/fulfillment*
+  api.use('/admin', brandsAdminRouter); // franchise Phase 0 — brand CRUD + member seed
+  api.use('/', brandsPublicRouter); // franchise Phase 1 — public /businesses/:id/trucks
+  api.use('/', brandOperatorPrivateRouter); // franchise Phase 2+3 — operator Stripe-onboard, owner approval, invites, overview
+  api.use('/', brandInvitePublicRouter); // franchise Phase 3 — public invite preview (no auth)
   api.use('/businesses', businessesRouter);
   api.use('/businesses', engagementRouter); // follow / notify-me
   api.use('/businesses', schedulingBusinessRouter); // services / availability

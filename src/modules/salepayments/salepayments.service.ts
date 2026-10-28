@@ -5,6 +5,7 @@ import { env } from '../../config/env';
 import { logger } from '../../config/logger';
 import { publish } from '../../events/bus';
 import { writeAudit } from '../../shared/audit';
+import { isOwnerSync } from '../../shared/businessAccess';
 import { formatCents } from '../../shared/money';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import {
@@ -498,7 +499,7 @@ export const salePaymentsService = {
     if (!checkout) throw NotFoundError('Checkout not found');
     const hub = await consignmentRepo.findHubById(checkout.hub_id);
     const isSeller = checkout.seller_id === principal.userId;
-    const isHubOwner = hub?.owner_user_id === principal.userId;
+    const isHubOwner = Boolean(hub && isOwnerSync(principal.userId, hub));
     if (!isSeller && !isHubOwner) {
       throw ForbiddenError('Not a participant', ERROR_CODES.NOT_PARTICIPANT);
     }

@@ -18,6 +18,16 @@ const BusinessSchema = new Schema(
   {
     owner_user_id: { type: String, required: true, index: true },
     /**
+     * The brand that owns this business (franchise Phase 0). Nullable + indexed: existing
+     * businesses are backfilled by `scripts/backfill-brands.ts` into one-business brands, and
+     * code that reads this field tolerates `null` by resolving to the business's own
+     * `owner_user_id` (the pre-brand behaviour). Phase 3 removes the null allowance once every
+     * row is backfilled and the UI flows depend on it.
+     *
+     * See FRANCHISE_IMPLEMENTATION_ROADMAP.md §Phase 0.
+     */
+    brand_id: { type: Schema.Types.ObjectId, ref: 'Brand', default: null, index: true },
+    /**
      * The owner's explicit module set (BUSINESS_MODULE_SYSTEM.md §3).
      * `undefined` means INHERIT the category archetype's defaults — NOT "no modules". That's why
      * it has no default: existing businesses keep resolving to full defaults with no backfill,

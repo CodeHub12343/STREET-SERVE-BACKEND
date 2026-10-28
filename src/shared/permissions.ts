@@ -256,6 +256,11 @@ export const PERMISSIONS = {
   // ─── Phase 8: launch hardening ────────────────────────────────────────────────────────────
   'admin:manage_sponsors': { roles: ['admin'] },
 
+  // ─── Franchise / multi-vendor (FRANCHISE_IMPLEMENTATION_ROADMAP.md Phase 0) ───────────────
+  // Admin-only in Phase 0: creation/attachment of brands and manual membership edits. Phase 3
+  // adds the signed-in brand owner's own self-service surface under separate `/brands/me/*` routes.
+  'admin:manage_businesses': { roles: ['admin'] },
+
   // ─── Phase 3 (RTO): rent-to-own (R20–R27) — jurisdiction- + approval-gated ────────────────
   'rto:manage_seller': { roles: ['seller', 'vendor', 'hub'] }, // list + manage own RTO offers
   'rto:accept': { roles: ALL_ROLES }, // any authenticated user can enter an RTO as the customer

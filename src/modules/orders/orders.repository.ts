@@ -36,6 +36,8 @@ export const ordersRepository = {
     processing_fee_cents: number;
     pay_it_forward_cents?: number;
     pay_it_forward_redemption_id?: string | null;
+    /** PIF-II — see `OrderSchema.pif_item_contribution_id`. */
+    pif_item_contribution_id?: string | null;
     status?: string;
     tip_cents: number;
     round_up_cents: number;

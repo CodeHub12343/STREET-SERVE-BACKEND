@@ -166,6 +166,159 @@ export const paymentsService = {
   },
 
   /**
+   * ═══ FRANCHISE / MULTI-VENDOR — Phase 2 policy-aware charge wrapper. ═══
+   *
+   * The order service calls THIS, not `charge` directly. For a `pooled` brand (today's world,
+   * and every single-owner business) it delegates to `charge` with zero behaviour change — the
+   * same destination charge, the same fee computation, the same transaction row. For a
+   * `per_operator` brand it switches to a PLATFORM charge so the money sits on the platform
+   * balance, ready to be split across operators at `completeForOrder` time.
+   *
+   * Why wrap rather than branch inside `charge`: `charge` is called by other paths (RTO
+   * instalments, booking captures, sale-payments) that must keep their destination-charge
+   * semantics regardless of franchise policy. Keeping Phase 2 confined to a wrapper means those
+   * paths cannot regress.
+   */
+  async chargeForBusinessOrder(input: {
+    customerId: string;
+    businessId: string;
+    amountCents: number;
+    discountAppliedCents?: number;
+    tipCents?: number;
+    roundUpCents?: number;
+    serviceFeeCents?: number;
+    processingFeeCents?: number;
+    idempotencyKey: string;
+    savePaymentMethod?: boolean;
+    paymentMethodId?: string;
+    offSession?: boolean;
+    customerEmail?: string;
+  }) {
+    const { brandPayoutsService } = await import('../brands/brandPayouts.service');
+    const policy = await brandPayoutsService.resolvePolicyForBusiness(input.businessId);
+    if (!policy || policy.mode === 'pooled') {
+      return this.charge({
+        customerId: input.customerId,
+        counterpartyType: 'business',
+        counterpartyId: input.businessId,
+        amountCents: input.amountCents,
+        discountAppliedCents: input.discountAppliedCents,
+        tipCents: input.tipCents,
+        roundUpCents: input.roundUpCents,
+        serviceFeeCents: input.serviceFeeCents,
+        processingFeeCents: input.processingFeeCents,
+        idempotencyKey: input.idempotencyKey,
+        savePaymentMethod: input.savePaymentMethod,
+        paymentMethodId: input.paymentMethodId,
+        offSession: input.offSession,
+        customerEmail: input.customerEmail,
+      });
+    }
+    return this.chargeToPlatformForOrder({
+      customerId: input.customerId,
+      businessId: input.businessId,
+      amountCents: input.amountCents,
+      discountAppliedCents: input.discountAppliedCents,
+      tipCents: input.tipCents,
+      roundUpCents: input.roundUpCents,
+      serviceFeeCents: input.serviceFeeCents,
+      processingFeeCents: input.processingFeeCents,
+      idempotencyKey: input.idempotencyKey,
+      customerEmail: input.customerEmail,
+    });
+  },
+
+  /**
+   * The per_operator path: a platform charge, no destination, with a transaction row that
+   * matches the shape `charge` produces so every downstream reader (refunds, reports,
+   * reconciliation) stays shape-compatible. The `connected_account_id` is set to the brand's
+   * owner account as a sensible routing hint; the actual money distribution happens in
+   * `completeForOrder` via `brandPayoutsService.settleTransaction`.
+   */
+  async chargeToPlatformForOrder(input: {
+    customerId: string;
+    businessId: string;
+    amountCents: number;
+    discountAppliedCents?: number;
+    tipCents?: number;
+    roundUpCents?: number;
+    serviceFeeCents?: number;
+    processingFeeCents?: number;
+    idempotencyKey: string;
+    customerEmail?: string;
+  }) {
+    const existing = await repo.findByIdempotencyKey(input.idempotencyKey);
+    if (existing) {
+      return {
+        transactionId: String(existing._id),
+        paymentIntentRef: existing.payment_intent_ref,
+        status: existing.status,
+        replay: true,
+      };
+    }
+    const tip = input.tipCents ?? 0;
+    const roundUp = input.roundUpCents ?? 0;
+    const serviceFee = input.serviceFeeCents ?? 0;
+    const processingFee = input.processingFeeCents ?? 0;
+    const feeBase = Math.max(0, input.amountCents - tip - roundUp - serviceFee - processingFee);
+    let platformFee = await feeService.resolveFee('marketplace', feeBase);
+    const { subscriptionsService } = await import('../subscriptions/subscriptions.service');
+    const discountBps = await subscriptionsService.marketplaceDiscountBps(input.businessId);
+    if (discountBps > 0) {
+      platformFee = Math.max(0, platformFee - Math.floor((feeBase * discountBps) / 10000));
+    }
+    const counterpartyNet = input.amountCents - platformFee;
+    const transferGroup = randomUUID();
+
+    const txn = await repo.createTransaction({
+      customer_id: input.customerId,
+      counterparty_type: 'business',
+      counterparty_id: input.businessId,
+      /** Platform-charge path: no single destination account. The empty string marks it. */
+      connected_account_id: '',
+      amount_cents: input.amountCents,
+      discount_applied_cents: input.discountAppliedCents ?? 0,
+      tip_cents: tip,
+      round_up_cents: roundUp,
+      fee_type: 'marketplace',
+      platform_fee_cents: platformFee,
+      service_fee_cents: serviceFee,
+      processing_fee_cents: processingFee,
+      currency: env.PLATFORM_CURRENCY,
+      fee_breakdown: { platform_cents: platformFee, counterparty_net_cents: counterpartyNet },
+      status: 'pending',
+      idempotency_key: input.idempotencyKey,
+      transfer_group: transferGroup,
+    });
+    const txnId = String(txn._id);
+
+    const charge = await stripe().createPlatformCharge({
+      amountCents: input.amountCents,
+      currency: env.PLATFORM_CURRENCY,
+      transferGroup,
+      metadata: {
+        transactionId: txnId,
+        counterpartyId: input.businessId,
+        kind: 'brand_split',
+      },
+      idempotencyKey: input.idempotencyKey,
+      receiptEmail: input.customerEmail,
+    });
+    await repo.setPaymentIntentRef(txnId, charge.paymentIntentId);
+
+    return {
+      transactionId: txnId,
+      paymentIntentRef: charge.paymentIntentId,
+      clientSecret: charge.clientSecret,
+      status: charge.status,
+      paymentMethodRef: null,
+      platformFeeCents: platformFee,
+      counterpartyNetCents: counterpartyNet,
+      replay: false,
+    };
+  },
+
+  /**
    * Charge a customer and split the money in one destination charge: the platform application fee
    * is retained and the net is routed to the counterparty's connected account. Tips and round-up
    * are 100% to the counterparty (no platform cut — FR-6.4).
@@ -476,6 +629,41 @@ export const paymentsService = {
       counterpartyId: txn.counterparty_id,
       amountCents: txn.amount_cents,
     });
+
+    /**
+     * ═══ FRANCHISE / MULTI-VENDOR — Phase 2 settlement hook. ═══
+     *
+     * For a `per_operator` brand, split the counterparty net across its operators. No-op for
+     * `pooled` brands and businesses with no brand (returns `executed: false`).
+     *
+     * Dynamic import because `brandPayoutsService` reaches back into this file via
+     * `paymentsService.payoutTransfer` for the owner-fallback path — a static import would
+     * close the cycle at module-load time.
+     *
+     * The split is attempted here (completion) rather than at charge time because the net is
+     * knowable only after fees are finalised and the charge has succeeded. A split failure logs
+     * loudly but does NOT undo the completion — the money is on the platform balance, and
+     * support can replay the settlement by hand.
+     */
+    if (txn.counterparty_type === 'business') {
+      try {
+        const { brandPayoutsService } = await import('../brands/brandPayouts.service');
+        const netCents =
+          txn.fee_breakdown?.counterparty_net_cents ??
+          Math.max(0, txn.amount_cents - (txn.platform_fee_cents ?? 0));
+        await brandPayoutsService.settleTransaction({
+          transactionId: String(txn._id),
+          businessId: String(txn.counterparty_id),
+          netCents,
+          transferGroup: txn.transfer_group,
+        });
+      } catch (err) {
+        logger.error(
+          { err, transactionId: String(txn._id) },
+          'brand split settlement failed — reconcile this transaction by hand',
+        );
+      }
+    }
   },
 
   /**
@@ -514,6 +702,28 @@ export const paymentsService = {
       idempotencyKey: `refund_${transactionId}`,
     });
     const updated = await repo.markRefunded(transactionId, refundId);
+
+    /**
+     * ═══ FRANCHISE / MULTI-VENDOR — Phase 2 refund reversal. ═══
+     *
+     * For a `per_operator` brand the money was never in a destination account — it sat on the
+     * platform balance and was then split via explicit transfers. Stripe's `reverse_transfer`
+     * on a platform charge has no transfer to reverse, so each `brand_split` leg must be
+     * reversed EXPLICITLY. No-op for pooled brands (nothing in brand_splits for them).
+     *
+     * Fired AFTER the customer refund has gone through so a reversal failure leaves the
+     * customer refunded correctly, with the brand-side mismatch logged for support rather than
+     * surfacing to the customer as a broken refund.
+     */
+    try {
+      const { brandPayoutsService } = await import('../brands/brandPayouts.service');
+      await brandPayoutsService.reverseForTransaction(transactionId);
+    } catch (err) {
+      logger.error(
+        { err, transactionId },
+        'brand split reversal failed after refund — resolve by hand',
+      );
+    }
     await writeAudit({
       actorId,
       action: 'transaction.refunded',

@@ -16,6 +16,7 @@ import { logger } from '../../config/logger';
 import { publish } from '../../events/bus';
 import { stripe } from '../../integrations/stripe';
 import { writeAudit } from '../../shared/audit';
+import { isOwnerSync } from '../../shared/businessAccess';
 import { distanceMeters } from '../../shared/geo';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import {
@@ -679,7 +680,7 @@ export const adsService = {
     if (kind === 'featured_hub') {
       const hub = await consignmentRepository.findHubById(subjectId);
       if (!hub) throw NotFoundError('Hub not found');
-      if (hub.owner_user_id !== principal.userId) {
+      if (!isOwnerSync(principal.userId, hub)) {
         throw ForbiddenError('You do not own this hub', ERROR_CODES.NOT_OWNER);
       }
       return;
@@ -687,7 +688,7 @@ export const adsService = {
     const product = await consignmentRepository.findProductById(subjectId);
     if (!product) throw NotFoundError('Product not found');
     const hub = await consignmentRepository.findHubById(product.hub_id);
-    if (!hub || hub.owner_user_id !== principal.userId) {
+    if (!hub || !isOwnerSync(principal.userId, hub)) {
       throw ForbiddenError('You do not own this product', ERROR_CODES.NOT_OWNER);
     }
   },

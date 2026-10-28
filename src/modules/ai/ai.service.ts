@@ -1,5 +1,6 @@
 import { AI_RECENT_WINDOW_DAYS } from '../../config/constants';
 import { publish } from '../../events/bus';
+import { isOwnerSync } from '../../shared/businessAccess';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import { ForbiddenError, NotFoundError } from '../../shared/errors/AppError';
 import type { Principal } from '../../shared/types/principal';
@@ -97,7 +98,7 @@ export const aiService = {
   async hubDashboard(principal: Principal, hubId: string) {
     const hub = await consignmentRepository.findHubById(hubId);
     if (!hub) throw NotFoundError('Hub not found');
-    if (hub.owner_user_id !== principal.userId) {
+    if (!isOwnerSync(principal.userId, hub)) {
       throw ForbiddenError('You do not own this hub', ERROR_CODES.NOT_OWNER);
     }
 

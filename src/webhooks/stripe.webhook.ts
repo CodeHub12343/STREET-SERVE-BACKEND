@@ -65,6 +65,11 @@ stripeWebhookRouter.post(
         // can never rise against money that has not arrived (ADR-005; the PingBudgetTopup lesson).
         const contribution = await payforwardService.creditContribution(String(obj.id));
         if (contribution.handled) break;
+        // A Pay It Forward SPECIFIC-ITEM contribution (PIF-II). Separate row collection from
+        // the pool, same "money credited here and only here" invariant.
+        const { payforwardItemsService } = await import('../modules/payforward/payforwardItems.service');
+        const itemContribution = await payforwardItemsService.onPaymentSucceeded(String(obj.id));
+        if (itemContribution.handled) break;
         // A Boost campaign contribution — captured on contribution (ADR-006), credited to the
         // campaign's own escrow account only once the money has actually arrived.
         const boost = await boostService.creditContribution(String(obj.id));
@@ -108,6 +113,11 @@ stripeWebhookRouter.post(
         // A contribution left at `pending` forever is indistinguishable from one still in flight.
         const failedContribution = await payforwardService.failContribution(String(obj.id), reason);
         if (failedContribution.handled) break;
+        const { payforwardItemsService: itemsSvc } = await import(
+          '../modules/payforward/payforwardItems.service'
+        );
+        const failedItem = await itemsSvc.onPaymentFailed(String(obj.id), reason);
+        if (failedItem.handled) break;
         const failedBoost = await boostService.failContribution(String(obj.id), reason);
         if (failedBoost.handled) break;
         const failedPostcard = await postcardsService.failByPaymentIntent(String(obj.id), reason);

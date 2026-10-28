@@ -55,11 +55,20 @@ export const PlaceOrderBody = z
      * would be the wrong kind of surprise on both sides.
      */
     usePayItForward: z.boolean().optional(),
+    /**
+     * PIF-II — the specific suspended item this order is claiming. Mutually exclusive with
+     * `usePayItForward` server-side (see `orders.service.place`).
+     */
+    claimPifItemContributionId: z.string().length(24).optional(),
   })
   .strict()
   .refine((v) => !(v.scheduledFor && v.destination), {
     message: 'An order can be scheduled for pickup or delivered, not both',
     path: ['destination'],
+  })
+  .refine((v) => !(v.usePayItForward && v.claimPifItemContributionId), {
+    message: 'Use the pool OR a specific item, not both',
+    path: ['claimPifItemContributionId'],
   });
 
 // Price preview (R9): same shape as placing, minus the idempotency requirement (no side effects).

@@ -226,6 +226,14 @@ export const ordersService = {
       destination?: DeliveryDestinationInput;
       /** PIF-4 — opt in to the community fund covering part or all of this order. */
       usePayItForward?: boolean;
+      /**
+       * PIF-II — claim a specific suspended item queued at this business. The customer picks
+       * one from the "Claimable items" list on the business profile; the backend reserves it
+       * on place(), commits it when payment succeeds, and releases it if payment fails. The
+       * item id MUST appear in `items` — a claim without the item in the cart would be free
+       * money for whatever the customer actually ordered.
+       */
+      claimPifItemContributionId?: string;
     },
     idempotencyKey: string,
   ) {
@@ -333,7 +341,64 @@ export const ordersService = {
       : null;
     const payItForwardCents = reservation?.amountCents ?? 0;
     const payItForwardReason = reservation?.reason ?? null;
-    const amountDueCents = breakdown.totalCents - payItForwardCents;
+
+    /**
+     * ═══ PIF-II specific-item claim. ═══
+     *
+     * Parallel to the pool reservation above but reserves ONE queued item at this business.
+     * The item must be in this cart — otherwise the claim covers a dish the customer didn't
+     * order, which would be a vendor-side loss, not a Pay It Forward.
+     *
+     * Mutually-exclusive with pool reservation via the shared `CommunityRedemption` day-slot:
+     * `payforwardItemsService.reserve()` writes the same (user, business, day) row the pool
+     * writes, so a customer who already claimed either path today is refused — same floor as
+     * the pool.
+     *
+     * Resolve the item's name first so the "must be in cart" check is deterministic and the
+     * error message names which item.
+     */
+    let itemClaim: { reservationId: string; itemContributionId: string; coverCents: number } | null =
+      null;
+    if (input.claimPifItemContributionId) {
+      if (reservation) {
+        throw BusinessRuleError(
+          ERROR_CODES.BUSINESS_RULE,
+          'You can only use one Pay It Forward option per order — the pool, or a specific item, not both.',
+        );
+      }
+      const { payforwardItemsService } = await import(
+        '../payforward/payforwardItems.service'
+      );
+      const { CommunityItemContributionModel } = await import(
+        '../payforward/payforward.model'
+      );
+      const target = await CommunityItemContributionModel.findById(
+        input.claimPifItemContributionId,
+      )
+        .lean()
+        .exec();
+      if (!target || target.business_id !== input.businessId || target.status !== 'funded') {
+        throw BusinessRuleError(
+          ERROR_CODES.BUSINESS_RULE,
+          'That pay-it-forward item is no longer available.',
+        );
+      }
+      if (!lineItems.some((li) => String(li.menu_item_id) === String(target.menu_item_id))) {
+        throw BusinessRuleError(
+          ERROR_CODES.BUSINESS_RULE,
+          `To claim the suspended ${target.menu_item_name_at_purchase}, add one to your cart.`,
+        );
+      }
+      itemClaim = await payforwardItemsService.reserve(principal, {
+        businessId: input.businessId,
+        menuItemId: String(target.menu_item_id),
+        orderId: 'pending',
+        userTier: principal.verificationTier,
+      });
+    }
+
+    const itemClaimCents = itemClaim?.coverCents ?? 0;
+    const amountDueCents = breakdown.totalCents - payItForwardCents - itemClaimCents;
 
     let charge: { transactionId: string } | null = null;
     try {
@@ -342,10 +407,16 @@ export const ordersService = {
        * for. Charging $0 to satisfy a data model would fail at the processor anyway.
        */
       if (amountDueCents > 0) {
-        charge = await paymentsService.charge({
+        /**
+         * `chargeForBusinessOrder` is a franchise-Phase-2 wrapper that picks the correct Stripe
+         * path for this business's brand policy: destination charge for pooled brands (today's
+         * exact behaviour), platform charge for per_operator brands (so the net can be split on
+         * completion). Single-owner profiles always hit the pooled branch — nothing changes for
+         * them.
+         */
+        charge = await paymentsService.chargeForBusinessOrder({
           customerId: principal.userId,
-          counterpartyType: 'business',
-          counterpartyId: input.businessId,
+          businessId: input.businessId,
           amountCents: amountDueCents,
           discountAppliedCents: breakdown.discountCents,
           tipCents: tip,
@@ -360,6 +431,17 @@ export const ordersService = {
     } catch (err) {
       if (reservation?.redemptionId)
         await payforwardService.release(reservation.redemptionId, 'payment_failed');
+      if (itemClaim) {
+        /** Mirror the pool rollback for PIF-II: free the item back to the queue + free the day-slot. */
+        const { payforwardItemsService } = await import(
+          '../payforward/payforwardItems.service'
+        );
+        await payforwardItemsService.releaseClaim(
+          itemClaim.reservationId,
+          itemClaim.itemContributionId,
+          'payment_failed',
+        );
+      }
       throw err;
     }
 
@@ -396,8 +478,14 @@ export const ordersService = {
        * disputes, and impact figures all have the real sale value to work from.
        */
       total_cents: breakdown.totalCents,
-      pay_it_forward_cents: payItForwardCents,
-      pay_it_forward_redemption_id: reservation?.redemptionId ?? null,
+      pay_it_forward_cents: payItForwardCents + itemClaimCents,
+      pay_it_forward_redemption_id:
+        reservation?.redemptionId ?? itemClaim?.reservationId ?? null,
+      /**
+       * PIF-II — persist both the item-contribution id (the thing claimed) and the shared
+       * redemption id (the day-slot). Commit/release at order lifecycle events read these.
+       */
+      pif_item_contribution_id: itemClaim?.itemContributionId ?? null,
       transaction_id: charge?.transactionId ?? null,
       /**
        * A card was opened but not confirmed, so this order does not exist as far as the vendor is
@@ -418,7 +506,23 @@ export const ordersService = {
      * `confirmByPaymentIntent` does all three when the payment settles. A fully covered order has
      * nothing left to collect, so it is announced right here, which is the only honest exception.
      */
-    if (!awaitingPayment) await this.announcePlaced(order, reservation?.redemptionId ?? null);
+    if (!awaitingPayment) {
+      await this.announcePlaced(order, reservation?.redemptionId ?? null);
+      /**
+       * PIF-II: a fully-covered order never reaches `confirmByPaymentIntent` (no card, no
+       * webhook), so the item has to commit HERE. The pool's `applyRedemption` runs inside
+       * `announcePlaced`; this is the item-side counterpart.
+       */
+      if (itemClaim) {
+        const { payforwardItemsService } = await import(
+          '../payforward/payforwardItems.service'
+        );
+        await payforwardItemsService.commitClaim(
+          itemClaim.reservationId,
+          itemClaim.itemContributionId,
+        );
+      }
+    }
     return {
       ...this.view(order),
       payment: charge,
@@ -522,6 +626,22 @@ export const ordersService = {
       } catch {
         // Not yet captured/settled — the pending PaymentIntent will not be completed; safe to ignore.
       }
+    }
+
+    /**
+     * PIF-II — if this order claimed a specific suspended item, put it back in the queue. The
+     * giver's intention was "whoever's next", so a cancellation routes the item to the next
+     * claimer rather than refunding the giver. The pool-side refund below handles the pool.
+     */
+    if (order.pif_item_contribution_id && order.pay_it_forward_redemption_id) {
+      const { payforwardItemsService } = await import(
+        '../payforward/payforwardItems.service'
+      );
+      await payforwardItemsService.uncommitForCancellation(
+        order.pay_it_forward_redemption_id,
+        order.pif_item_contribution_id,
+        reason ?? 'order_cancelled',
+      );
     }
 
     /**
@@ -728,6 +848,21 @@ export const ordersService = {
     if (!claimed) return { handled: true }; // a concurrent delivery won the race
 
     await this.announcePlaced(order, order.pay_it_forward_redemption_id ?? null);
+    /**
+     * PIF-II commit — flip the reserved item to `claimed` and the shared redemption slot to
+     * `applied`. Pool reservations commit inside `announcePlaced` via the existing
+     * `payforwardService.applyRedemption` path; items don't, because they live in a separate
+     * collection with a separate transition set.
+     */
+    if (order.pif_item_contribution_id && order.pay_it_forward_redemption_id) {
+      const { payforwardItemsService } = await import(
+        '../payforward/payforwardItems.service'
+      );
+      await payforwardItemsService.commitClaim(
+        order.pay_it_forward_redemption_id,
+        order.pif_item_contribution_id,
+      );
+    }
     await paymentsService.completeByPaymentIntent(paymentIntentRef);
     return { handled: true };
   },
@@ -756,8 +891,20 @@ export const ordersService = {
     /**
      * Hand the community money straight back. A reservation held against an order that will never
      * happen is money withheld from someone who could have used it today.
+     *
+     * PIF-II: a claimed item also goes back onto the queue, and its shared redemption slot
+     * is released so the user isn't locked out of PIF today for an order that never happened.
      */
-    if (order.pay_it_forward_redemption_id) {
+    if (order.pif_item_contribution_id && order.pay_it_forward_redemption_id) {
+      const { payforwardItemsService } = await import(
+        '../payforward/payforwardItems.service'
+      );
+      await payforwardItemsService.releaseClaim(
+        order.pay_it_forward_redemption_id,
+        order.pif_item_contribution_id,
+        'payment_failed',
+      );
+    } else if (order.pay_it_forward_redemption_id) {
       await payforwardService.release(order.pay_it_forward_redemption_id, 'payment_failed');
     }
 

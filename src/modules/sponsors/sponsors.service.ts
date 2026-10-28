@@ -1,15 +1,25 @@
 import { randomUUID } from 'node:crypto';
 
-import { SPONSOR_TERM_MONTHS, SPONSOR_TIERS } from '../../config/constants';
+import {
+  DEFAULT_SPONSOR_PROGRAM,
+  GIVEAWAY_SPONSOR_TIERS,
+  SPONSOR_PROGRAMS,
+  SPONSOR_TERM_MONTHS,
+  SPONSOR_TIERS,
+  type SponsorProgram,
+} from '../../config/constants';
 import { logger } from '../../config/logger';
 import { formatCents } from '../../shared/money';
 import { notificationsService } from '../notifications/notifications.service';
 import { stripe } from '../../integrations/stripe';
 import { notifyOps } from '../../integrations/messaging';
 import { paymentsService } from '../payments/payments.service';
+import { agreementsService } from '../agreements/agreements.service';
+import { isAgreementReviewed } from '../agreements/agreements.registry';
+import { sponsorFulfillmentService } from '../sponsorFulfillment/sponsorFulfillment.service';
 import { writeAudit } from '../../shared/audit';
 import { ERROR_CODES } from '../../shared/errors/codes';
-import { ConflictError, NotFoundError } from '../../shared/errors/AppError';
+import { BusinessRuleError, ConflictError, NotFoundError } from '../../shared/errors/AppError';
 import type { Principal } from '../../shared/types/principal';
 import { PreregistrationModel, SponsorModel } from './sponsors.model';
 
@@ -23,10 +33,70 @@ function utmCodeFor(name: string): string {
   return `${base || 'sponsor'}-${randomUUID().slice(0, 6)}`;
 }
 
+/**
+ * Slug for the public profile URL. Collisions get a short suffix so renames are safe and the
+ * failure mode is a longer slug, not a 500. The sparse unique index on `slug` is the real
+ * backstop — this just makes the collision rare.
+ */
+function slugFor(name: string, suffix?: string): string {
+  const base = name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 60);
+  if (!base) return `sponsor-${randomUUID().slice(0, 8)}`;
+  return suffix ? `${base}-${suffix}` : base;
+}
+
+/**
+ * Tiers whose rate card includes "featured sponsor profile". A Silver sponsor can set profile
+ * fields but their profile page is not public, because they didn't buy that benefit.
+ */
+const PROFILE_ENABLED_TIERS: Record<string, Set<string>> = {
+  platform: new Set(['launch', 'founding']),
+  ice_cream_giveaway: new Set(['gold', 'platinum', 'diamond']),
+};
+function tierHasPublicProfile(program: string, tier: string): boolean {
+  return PROFILE_ENABLED_TIERS[program]?.has(tier) ?? false;
+}
+
+function resolveProgram(input: string | null | undefined): SponsorProgram {
+  if (!input) return DEFAULT_SPONSOR_PROGRAM;
+  return (SPONSOR_PROGRAMS as readonly string[]).includes(input)
+    ? (input as SponsorProgram)
+    : DEFAULT_SPONSOR_PROGRAM;
+}
+
 export const sponsorsService = {
-  /** The public rate card. Prices live in code so a fee-schedule edit cannot move them. */
-  listTiers() {
+  /**
+   * The public rate card. Prices live in code so a fee-schedule edit cannot move them.
+   *
+   * Returns a program-shaped payload: `priceMode` is `monthly` for the long-running platform
+   * sponsorships (price = `monthlyCents` × months) and `one_time` for the Ice Cream Giveaway
+   * campaign (price = `priceCents`, term fixed at 3 months). The checkout UI branches on this
+   * one field — no second mental model needed per program.
+   */
+  listTiers(programInput?: string | null) {
+    const program = resolveProgram(programInput);
+    if (program === 'ice_cream_giveaway') {
+      /**
+       * The CHECKOUT rate card: self-serve tiers only. Diamond is advertised on the landing page
+       * as a Contact-us tier, so hiding it here is what makes the contact flow authoritative —
+       * if a client renders the giveaway checkout from this response alone, it cannot accidentally
+       * show a Buy button for Diamond. The landing page reads tier content from a separate
+       * display catalogue (`giveawayProgram` on the frontend).
+       */
+      return {
+        program,
+        priceMode: 'one_time' as const,
+        tiers: GIVEAWAY_SPONSOR_TIERS.filter((t) => t.selfServe).map((t) => ({ ...t })),
+        /** Term is fixed to 90 days for this program; the checkout hides the term chip. */
+        termMonths: [GIVEAWAY_SPONSOR_TIERS[0].termMonths],
+      };
+    }
     return {
+      program,
+      priceMode: 'monthly' as const,
       tiers: SPONSOR_TIERS.map((t) => ({ ...t })),
       termMonths: [...SPONSOR_TERM_MONTHS],
     };
@@ -51,28 +121,99 @@ export const sponsorsService = {
       logoUrl?: string;
       contactEmail: string;
       launchCitySlug?: string;
+      program?: string;
     },
     idempotencyKey: string,
   ) {
-    const tier = SPONSOR_TIERS.find((t) => t.slug === dto.tier);
-    if (!tier) throw NotFoundError('No such sponsorship tier');
-    if (!(SPONSOR_TERM_MONTHS as readonly number[]).includes(dto.termMonths)) {
-      throw ConflictError(ERROR_CODES.BUSINESS_RULE, 'Choose one of the available terms');
+    const program = resolveProgram(dto.program);
+
+    /**
+     * ═══ §60 LAUNCH GATE. ═══
+     *
+     * No real sponsor pays under unreviewed terms, period. RTO uses the same gate; copying its
+     * mechanism rather than inventing one keeps the "has counsel signed off" question a single
+     * answer per agreement type. In production this fails outright; in test, `setAgreementReviewedForTest`
+     * lets flows be exercised without pretending the gate is off.
+     */
+    if (!isAgreementReviewed('sponsorship')) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        'Sponsorship purchases are temporarily unavailable while the agreement is being finalised. Please check back shortly.',
+      );
     }
-    const amountCents = tier.monthlyCents * dto.termMonths;
+
+    /**
+     * ═══ Agreement gate. ═══
+     *
+     * The sponsorship agreement is accepted BEFORE the card is charged. Our own landing-page
+     * disclaimer says terms are "documented before any payment is accepted"; taking a card first
+     * and surfacing the terms later would be a copy-vs-flow mismatch worth money. Enforced
+     * server-side rather than in the UI: a client that skipped the step would otherwise reach
+     * `chargeToPlatform` with no acceptance on record.
+     */
+    await agreementsService.assertAccepted(principal.userId, 'sponsorship');
+
+    /**
+     * Pricing branches on program. For `platform`, price = monthlyCents × months and the term is
+     * a chosen value from SPONSOR_TERM_MONTHS. For `ice_cream_giveaway`, price is the one-time
+     * `priceCents` and the term is fixed to the tier's own `termMonths` — any client-supplied
+     * `termMonths` for a giveaway tier is ignored, so a sponsor cannot pay for Silver and claim
+     * a 12-month campaign.
+     */
+    let tierSlug: string;
+    let amountCents: number;
+    let termMonths: number;
+
+    if (program === 'ice_cream_giveaway') {
+      const tier = GIVEAWAY_SPONSOR_TIERS.find((t) => t.slug === dto.tier);
+      if (!tier) throw NotFoundError('No such sponsorship tier');
+      /**
+       * Diamond is not self-serve. The rate card hides it from checkout; this is the server-side
+       * backstop that stops a client posting `tier: "diamond"` anyway. Hand-recorded Diamond
+       * deals go through the existing admin create endpoint, which has no selfServe guard.
+       */
+      if (!tier.selfServe) {
+        throw BusinessRuleError(
+          ERROR_CODES.BUSINESS_RULE,
+          'This tier is only available through a direct conversation — please contact us to arrange it.',
+        );
+      }
+      tierSlug = tier.slug;
+      amountCents = tier.priceCents;
+      termMonths = tier.termMonths;
+    } else {
+      const tier = SPONSOR_TIERS.find((t) => t.slug === dto.tier);
+      if (!tier) throw NotFoundError('No such sponsorship tier');
+      if (!(SPONSOR_TERM_MONTHS as readonly number[]).includes(dto.termMonths)) {
+        throw ConflictError(ERROR_CODES.BUSINESS_RULE, 'Choose one of the available terms');
+      }
+      tierSlug = tier.slug;
+      amountCents = tier.monthlyCents * dto.termMonths;
+      termMonths = dto.termMonths;
+    }
+
+    const utmCode = utmCodeFor(dto.name);
+    /**
+     * Slug uses the UTM suffix as its collision-breaker. Both are generated from the name but the
+     * UTM already carries a random suffix, so reusing the last 6 chars of it both guarantees
+     * uniqueness and keeps the slug deterministic from a single randomness source.
+     */
+    const slug = slugFor(dto.name, utmCode.slice(-6));
 
     const sponsor = await SponsorModel.create({
       name: dto.name,
-      utm_code: utmCodeFor(dto.name),
+      utm_code: utmCode,
+      slug,
       logo_url: dto.logoUrl ?? null,
-      tier: tier.slug,
+      tier: tierSlug,
+      program,
       launch_city_slug: dto.launchCitySlug ?? null,
       status: 'pending_payment',
       /** Not live — and not live on payment either. See the model. */
       active: false,
       owner_user_id: principal.userId,
       contact_email: dto.contactEmail,
-      term_months: dto.termMonths,
+      term_months: termMonths,
     });
     const sponsorId = String(sponsor._id);
 
@@ -83,7 +224,7 @@ export const sponsorsService = {
     const charge = await paymentsService.chargeToPlatform({
       amountCents,
       transferGroup: `sponsor_${sponsorId}`,
-      metadata: { kind: 'sponsorship', sponsorId, tier: tier.slug },
+      metadata: { kind: 'sponsorship', sponsorId, tier: tierSlug, program },
       idempotencyKey: `sponsor_${idempotencyKey}`,
       ...(dto.contactEmail ? { receiptEmail: dto.contactEmail } : {}),
     });
@@ -95,8 +236,9 @@ export const sponsorsService = {
     return {
       id: sponsorId,
       name: sponsor.name,
-      tier: tier.slug,
-      termMonths: dto.termMonths,
+      program,
+      tier: tierSlug,
+      termMonths,
       amountCents,
       clientSecret: charge.clientSecret,
       /** Said plainly, so the client never renders "you are live". */
@@ -115,9 +257,16 @@ export const sponsorsService = {
     if (!found) return { handled: false }; // not ours — let the next handler try
 
     const sponsorId = String(found._id);
+    /**
+     * Re-derive what was actually owed from the tier table — same guard as `purchase`. Branches
+     * on program because platform is monthly × term, giveaway is a one-time package price.
+     */
+    const sponsorProgram = resolveProgram(found.program);
     const paidCents =
-      (found.term_months ?? 1) *
-      (SPONSOR_TIERS.find((t) => t.slug === found.tier)?.monthlyCents ?? 0);
+      sponsorProgram === 'ice_cream_giveaway'
+        ? (GIVEAWAY_SPONSOR_TIERS.find((t) => t.slug === found.tier)?.priceCents ?? 0)
+        : (found.term_months ?? 1) *
+          (SPONSOR_TIERS.find((t) => t.slug === found.tier)?.monthlyCents ?? 0);
 
     const claimed = await SponsorModel.findOneAndUpdate(
       { _id: sponsorId, pending_intent_ref: paymentIntentId },
@@ -214,6 +363,28 @@ export const sponsorsService = {
       { _id: sponsorId },
       { $set: { status: 'active', active: true, starts_at: now, ends_at: ends } },
     ).exec();
+
+    /**
+     * Seed the fulfilment tracker. The committed counts for the tier (shout-outs, promotional
+     * videos, postcards, spotlight videos) are what the sponsor paid for, so they are frozen on
+     * approval rather than resolved from the tier table at report time: a later tier edit must
+     * not change what an existing sponsor was promised. Idempotent — a repeat approval does not
+     * reset counts a logger already pushed.
+     */
+    try {
+      await sponsorFulfillmentService.seedForSponsor({
+        sponsorId,
+        tier: sponsor.tier,
+        program: resolveProgram(sponsor.program),
+        startedAt: now,
+        endsAt: ends,
+      });
+    } catch (err) {
+      logger.error(
+        { err, sponsorId },
+        'sponsor approved but fulfilment seed failed — seed it by hand',
+      );
+    }
 
     if (sponsor.owner_user_id) {
       notificationsService.notify(sponsor.owner_user_id, {
@@ -373,17 +544,21 @@ export const sponsorsService = {
       utmCode: string;
       logoUrl?: string;
       tier?: string;
+      program?: string;
       launchCitySlug?: string;
       contractedCents?: number;
       note?: string;
     },
   ) {
+    const program = resolveProgram(dto.program);
     try {
       const sponsor = await SponsorModel.create({
         name: dto.name,
         utm_code: dto.utmCode,
+        slug: slugFor(dto.name, dto.utmCode.slice(-6)),
         logo_url: dto.logoUrl ?? null,
         tier: dto.tier ?? 'launch',
+        program,
         launch_city_slug: dto.launchCitySlug ?? null,
         contracted_cents: dto.contractedCents ?? 0,
         note: dto.note ?? null,
@@ -415,8 +590,13 @@ export const sponsorsService = {
    * Includes inactive sponsors: a finished sponsorship is exactly the record an operator goes
    * looking for, and hiding it would make the roster useless the moment a term ended.
    */
-  async listAll(limit = 200) {
-    const sponsors = await SponsorModel.find()
+  async listAll(filter: { program?: string | null } = {}, limit = 200) {
+    const program = filter.program ? resolveProgram(filter.program) : null;
+    const query: Record<string, unknown> = {};
+    if (program) {
+      query.program = program === DEFAULT_SPONSOR_PROGRAM ? { $in: [program, null] } : program;
+    }
+    const sponsors = await SponsorModel.find(query)
       .sort({ active: -1, created_at: -1 })
       .limit(limit)
       .lean()
@@ -426,6 +606,7 @@ export const sponsorsService = {
       name: s.name,
       logoUrl: s.logo_url ?? null,
       tier: s.tier,
+      program: s.program ?? DEFAULT_SPONSOR_PROGRAM,
       utmCode: s.utm_code,
       launchCitySlug: s.launch_city_slug ?? null,
       active: s.active !== false,
@@ -462,6 +643,7 @@ export const sponsorsService = {
       name?: string;
       logoUrl?: string | null;
       tier?: string;
+      program?: string;
       launchCitySlug?: string | null;
       contractedCents?: number;
       note?: string | null;
@@ -472,6 +654,7 @@ export const sponsorsService = {
     if (patch.name !== undefined) $set.name = patch.name;
     if (patch.logoUrl !== undefined) $set.logo_url = patch.logoUrl;
     if (patch.tier !== undefined) $set.tier = patch.tier;
+    if (patch.program !== undefined) $set.program = resolveProgram(patch.program);
     if (patch.launchCitySlug !== undefined) $set.launch_city_slug = patch.launchCitySlug;
     if (patch.contractedCents !== undefined) $set.contracted_cents = patch.contractedCents;
     if (patch.note !== undefined) $set.note = patch.note;
@@ -503,10 +686,23 @@ export const sponsorsService = {
     };
   },
 
-  /** Public list for logo placement — no internal counters exposed. */
-  async listActive() {
-    const sponsors = await SponsorModel.find({ active: true })
-      .select('name logo_url tier utm_code')
+  /**
+   * Public list for logo placement — no internal counters exposed.
+   *
+   * Optional `program` filter: the Great Ice Cream Giveaway page shows ONLY its own sponsors,
+   * and the main landing page shows ONLY platform sponsors. Without the filter the two rosters
+   * would collide — a Silver $3K giveaway sponsor would appear next to the long-running platform
+   * partners, which is not what either side agreed to.
+   */
+  async listActive(programInput?: string | null) {
+    const program = programInput ? resolveProgram(programInput) : null;
+    const query: Record<string, unknown> = { active: true };
+    if (program) {
+      /** `$in [program, null]` picks up pre-field rows that implicitly belong to `platform`. */
+      query.program = program === DEFAULT_SPONSOR_PROGRAM ? { $in: [program, null] } : program;
+    }
+    const sponsors = await SponsorModel.find(query)
+      .select('name logo_url tier utm_code program')
       .lean()
       .exec();
     return sponsors.map((s) => ({
@@ -514,6 +710,7 @@ export const sponsorsService = {
       name: s.name,
       logoUrl: s.logo_url,
       tier: s.tier,
+      program: s.program ?? DEFAULT_SPONSOR_PROGRAM,
       /**
        * Returned so the page that renders the logo can also report the impression — the endpoint
        * keys on the UTM code, and without it the caller had nothing to send. Not a secret: it is
@@ -594,6 +791,121 @@ export const sponsorsService = {
   /** Public waitlist size for the landing page's metrics strip — a bare count, no PII. */
   async preregistrationCount() {
     return { count: await PreregistrationModel.estimatedDocumentCount().exec() };
+  },
+
+  /**
+   * ═══ Public sponsor profile. ═══
+   *
+   * Resolved by slug (which may be the UTM code as a legacy fallback), returns only safe fields
+   * for anonymous viewing. Hard-gated on tier: a Silver sponsor who set website_url + about
+   * does not get a public page, because they didn't buy that benefit.
+   *
+   * Impressions on the sponsor profile fall under the SAME counter as logo-placement impressions
+   * — a view is a view. Recording that is left to the frontend's existing `recordImpression`
+   * flow, keyed by UTM, which stays the single counter the sponsor sees in their dashboard.
+   */
+  async getPublicProfile(slugOrId: string) {
+    const sponsor = await SponsorModel.findOne({
+      active: true,
+      $or: [{ slug: slugOrId }, { utm_code: slugOrId }],
+    })
+      .select('name logo_url tier program blurb website_url about utm_code slug')
+      .lean()
+      .exec();
+    if (!sponsor) throw NotFoundError('No such sponsor profile');
+
+    const program = sponsor.program ?? DEFAULT_SPONSOR_PROGRAM;
+    if (!tierHasPublicProfile(program, sponsor.tier ?? '')) {
+      /**
+       * Deliberately a 404, not a 403: a profile that isn't published shouldn't advertise its own
+       * existence. The sponsor still gets their roster logo everywhere else.
+       */
+      throw NotFoundError('No such sponsor profile');
+    }
+    return {
+      name: sponsor.name,
+      logoUrl: sponsor.logo_url ?? null,
+      tier: sponsor.tier,
+      program,
+      websiteUrl: sponsor.website_url ?? null,
+      about: sponsor.about ?? null,
+      utmCode: sponsor.utm_code,
+      slug: sponsor.slug ?? sponsor.utm_code,
+    };
+  },
+
+  /**
+   * Owner self-service: update profile fields on the sponsor THEY own. Only website_url + about
+   * are writable — tier, logo, slug, status are not. A sponsor cannot change what they bought
+   * from their own dashboard; those stay admin-controlled.
+   */
+  async updateOwnProfile(
+    principal: Principal,
+    patch: { websiteUrl?: string | null; about?: string | null },
+  ) {
+    const $set: Record<string, unknown> = {};
+    if (patch.websiteUrl !== undefined) $set.website_url = patch.websiteUrl;
+    if (patch.about !== undefined) $set.about = patch.about;
+    const sponsor = await SponsorModel.findOneAndUpdate(
+      { owner_user_id: principal.userId, active: true },
+      { $set },
+      { new: true },
+    )
+      .lean()
+      .exec();
+    if (!sponsor) throw NotFoundError('No active sponsorship to update');
+    await writeAudit({
+      actorId: principal.userId,
+      action: 'sponsor.profile.updated',
+      entityType: 'sponsor',
+      entityId: String(sponsor._id),
+      metadata: patch as Record<string, unknown>,
+    });
+    return {
+      websiteUrl: sponsor.website_url ?? null,
+      about: sponsor.about ?? null,
+      slug: sponsor.slug ?? null,
+      /** The signed-in sponsor's own public profile URL (if their tier qualifies). */
+      hasPublicProfile: tierHasPublicProfile(
+        sponsor.program ?? DEFAULT_SPONSOR_PROGRAM,
+        sponsor.tier ?? '',
+      ),
+    };
+  },
+
+  /**
+   * Reach + attribution for the signed-in sponsor's own campaign — the figures the sponsor's
+   * dashboard shows alongside the fulfilment counts. Same shape as the admin report, scoped by
+   * owner_user_id so a sponsor can only ever see their own.
+   */
+  async getOwnStats(principal: Principal) {
+    const sponsor = await SponsorModel.findOne({
+      owner_user_id: principal.userId,
+      active: true,
+    })
+      .sort({ created_at: -1 })
+      .lean()
+      .exec();
+    if (!sponsor) return null;
+    const impressions = sponsor.impressions_count ?? 0;
+    const attributedSignups = sponsor.attributed_signups_count ?? 0;
+    return {
+      impressions,
+      attributedSignups,
+      utmCode: sponsor.utm_code,
+      /** Null when there are no impressions yet — a rate on zero would be a lie. */
+      signupRatePercent:
+        impressions > 0
+          ? Math.round((attributedSignups / impressions) * 1000) / 10
+          : null,
+      websiteUrl: sponsor.website_url ?? null,
+      about: sponsor.about ?? null,
+      slug: sponsor.slug ?? null,
+      hasPublicProfile: tierHasPublicProfile(
+        sponsor.program ?? DEFAULT_SPONSOR_PROGRAM,
+        sponsor.tier ?? '',
+      ),
+    };
   },
 
   async report(_admin: Principal, sponsorId: string) {

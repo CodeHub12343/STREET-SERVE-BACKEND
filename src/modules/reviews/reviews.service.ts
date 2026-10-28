@@ -5,6 +5,7 @@ import { ERROR_CODES } from '../../shared/errors/codes';
 import { ConflictError, ForbiddenError, NotFoundError } from '../../shared/errors/AppError';
 import type { Principal } from '../../shared/types/principal';
 import { TransactionModel } from '../payments/payments.model';
+import { BusinessModel } from '../vendors/vendors.model';
 import { ReviewModel } from './reviews.model';
 
 export const reviewsService = {
@@ -22,6 +23,13 @@ export const reviewsService = {
       /** CU-30 — presigned-uploaded photo URLs. */
       photos?: string[];
       transactionId: string;
+      /**
+       * Franchise Phase 4 — optional operator callout. When the customer specifically wants to
+       * acknowledge (or complain about) a particular truck's service, they can tag the review
+       * with the operator id they ordered from. Does NOT change which subject earned the
+       * rating; the rating still counts toward the business/brand aggregate.
+       */
+      operatorId?: string;
     },
   ) {
     const txn = await TransactionModel.findById(input.transactionId).lean().exec();
@@ -42,6 +50,18 @@ export const reviewsService = {
       );
     }
 
+    /**
+     * Franchise Phase 4 — resolve brand_id for a business review so the brand aggregate query
+     * doesn't have to join to the businesses collection at read time. Null when the subject is
+     * a seller (no brand) or a brand-less business — the brand aggregate query handles those
+     * gracefully (nothing matches brand_id = null).
+     */
+    let brandId: string | null = null;
+    if (input.subjectType === 'business') {
+      const business = await BusinessModel.findById(input.subjectId).select('brand_id').lean().exec();
+      brandId = business?.brand_id ? String(business.brand_id) : null;
+    }
+
     try {
       const review = await ReviewModel.create({
         author_id: principal.userId,
@@ -51,6 +71,8 @@ export const reviewsService = {
         comment: input.comment ?? null,
         photos: input.photos ?? [],
         transaction_id: input.transactionId,
+        brand_id: brandId,
+        operator_id: input.operatorId ?? null,
       });
       await publish('review.created', {
         reviewId: String(review._id),
@@ -67,7 +89,24 @@ export const reviewsService = {
   },
 
   async listForSubject(subjectType: 'business' | 'seller', subjectId: string, limit: number) {
-    const reviews = await ReviewModel.find({ subject_type: subjectType, subject_id: subjectId })
+    /**
+     * Franchise Phase 4 — for a business subject, aggregate at the BRAND level if the business
+     * belongs to a brand. A customer rating truck 1 and a customer rating truck 2 both count
+     * toward the brand's single 4.6★ figure the map pin shows. Seller subjects are unchanged.
+     *
+     * The read is one extra lookup (business → brand_id) when the subject is a business; the
+     * resulting Mongo query uses either the `brand_id` index (brand-level) or the existing
+     * `(subject_type, subject_id)` index (legacy or brand-less).
+     */
+    let brandId: string | null = null;
+    if (subjectType === 'business') {
+      const business = await BusinessModel.findById(subjectId).select('brand_id').lean().exec();
+      brandId = business?.brand_id ? String(business.brand_id) : null;
+    }
+    const query = brandId
+      ? { brand_id: brandId }
+      : { subject_type: subjectType, subject_id: subjectId };
+    const reviews = await ReviewModel.find(query)
       .sort({ created_at: -1 })
       .limit(limit)
       .lean()
@@ -77,11 +116,15 @@ export const reviewsService = {
     return {
       average: Math.round(avg * 10) / 10,
       count,
+      /** True when the aggregate pools reviews across a multi-truck brand (for frontend copy). */
+      brandAggregate: Boolean(brandId),
       reviews: reviews.map((r) => ({
         rating: r.rating,
         comment: r.comment,
         authorId: r.author_id,
         createdAt: r.created_at,
+        /** Franchise Phase 4 — set when the reviewer tagged a specific truck. */
+        operatorId: r.operator_id ?? null,
         /**
          * Moderation hides the PHOTOS, never the review. A business that could bury criticism by
          * reporting the picture attached to it would have been handed a takedown button.

@@ -12,6 +12,7 @@ import {
 } from '../../config/constants';
 import { publish } from '../../events/bus';
 import { writeAudit } from '../../shared/audit';
+import { isOwnerSync } from '../../shared/businessAccess';
 import { formatCents } from '../../shared/money';
 import { ERROR_CODES } from '../../shared/errors/codes';
 import {
@@ -266,7 +267,7 @@ export const shelterService = {
   async assertPartnerOwner(principal: Principal, partnerId: string) {
     const partner = await ShelterPartnerModel.findById(partnerId).exec();
     if (!partner) throw NotFoundError('Shelter partner not found');
-    if (partner.owner_user_id !== principal.userId) {
+    if (!isOwnerSync(principal.userId, partner)) {
       throw ForbiddenError('Not your shelter partner', ERROR_CODES.NOT_OWNER);
     }
     if (partner.status !== 'verified') {

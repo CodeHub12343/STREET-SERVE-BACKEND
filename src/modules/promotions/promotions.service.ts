@@ -233,6 +233,35 @@ export const promotionsService = {
   },
 
   /**
+   * Franchise Phase 4 — the pin-level discount for one operator. Same shape as
+   * `liveDiscountByBusiness` but filters out sales whose `excluded_operator_ids` contains the
+   * named operator. Used by the live map to render the correct discount percent on an operator
+   * pin: "20% off" belongs on the Richmond truck pin but NOT on the Oakland one when Oakland
+   * is excluded.
+   */
+  async liveDiscountForOperator(
+    businessId: string,
+    operatorId: string,
+    now: Date = new Date(),
+  ): Promise<number> {
+    const sales = await FlashSaleModel.find({
+      business_id: businessId,
+      menu_item_id: null,
+      cancelled_at: null,
+      starts_at: { $lte: now },
+      ends_at: { $gt: now },
+    })
+      .select({ percent: 1, excluded_operator_ids: 1 })
+      .lean();
+    let best = 0;
+    for (const s of sales) {
+      if ((s.excluded_operator_ids ?? []).includes(operatorId)) continue;
+      if (s.percent > best) best = s.percent;
+    }
+    return best;
+  },
+
+  /**
    * The contest candidates for one order.
    *
    * Item-scoped sales are returned only for items actually in the cart — a 50%-off sale on a drink
@@ -242,6 +271,13 @@ export const promotionsService = {
     businessId: string,
     menuItemIds: string[],
     now: Date = new Date(),
+    /**
+     * Franchise Phase 4 — the operator this order is being closed at. Caller passes the
+     * `operatorId` resolved from the active live session (or null for single-owner / non-brand
+     * orders). Sales whose `excluded_operator_ids` include this operator are dropped from the
+     * contest, honouring per-operator exclusions at checkout.
+     */
+    operatorId: string | null = null,
   ): Promise<PriceDiscount[]> {
     const sales = await FlashSaleModel.find({
       business_id: businessId,
@@ -253,6 +289,10 @@ export const promotionsService = {
     const inCart = new Set(menuItemIds);
     return sales
       .filter((s) => !s.menu_item_id || inCart.has(s.menu_item_id))
+      .filter(
+        (s) =>
+          !operatorId || !(s.excluded_operator_ids ?? []).includes(operatorId),
+      )
       .map((s) => toDiscount(s));
   },
 };

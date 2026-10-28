@@ -31,6 +31,21 @@ const FlashSaleSchema = new Schema(
      */
     cancelled_at: { type: Date, default: null },
     created_by: { type: String, required: true },
+
+    /**
+     * ═══ FRANCHISE / MULTI-VENDOR — Phase 4 operator exclusion. ═══
+     *
+     * Operator ids to EXCLUDE from this sale. Default empty = applies at every operator. The
+     * roadmap's "20% off at every James's truck except Oakland" is modelled by setting the
+     * Oakland operator id here. Resolution happens at checkout: the discount engine reads the
+     * completing operator (via the order's active live session) and skips any sale whose
+     * excluded_operator_ids include it.
+     *
+     * Why exclusion rather than inclusion: the common case is "all trucks of the brand", and a
+     * list of inclusions would get stale the moment a new operator is added. Excluding named
+     * operators keeps new trucks eligible by default.
+     */
+    excluded_operator_ids: { type: [String], default: [] },
   },
   { timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: 'flash_sales' },
 );

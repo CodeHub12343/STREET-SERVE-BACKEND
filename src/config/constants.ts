@@ -1841,3 +1841,138 @@ export type SponsorTierSlug = (typeof SPONSOR_TIERS)[number]['slug'];
 
 /** The terms a sponsor may buy. Longer terms exist so a sponsor is not re-billed every month. */
 export const SPONSOR_TERM_MONTHS = [1, 3, 6, 12] as const;
+
+/**
+ * ═══ SPONSORSHIP PROGRAMS ═══
+ *
+ * A sponsorship record belongs to exactly one program. `platform` is the long-running
+ * landing-page sponsorship (SPONSOR_TIERS above). `ice_cream_giveaway` is the 90-day Great Ice
+ * Cream Giveaway campaign — different tier slugs, different pricing, same lifecycle.
+ *
+ * Modelled as a field rather than a separate collection because every stage after purchase
+ * (payment-intent reconciliation, hand-review, refund-on-reject, term expiry, impression + UTM
+ * attribution, admin roster) is identical: forking the collection would duplicate all of it and
+ * then drift. The listing endpoints filter by program; the public landing pages read the
+ * matching slice.
+ */
+export const SPONSOR_PROGRAMS = ['platform', 'ice_cream_giveaway'] as const;
+export type SponsorProgram = (typeof SPONSOR_PROGRAMS)[number];
+export const DEFAULT_SPONSOR_PROGRAM: SponsorProgram = 'platform';
+
+/**
+ * The Great Ice Cream Giveaway sponsorship packages. One-time price for a fixed 90-day window —
+ * NOT monthly. A sponsor pays once, gets a 3-month campaign, and the placement comes down. The
+ * server re-derives the price from this table on every purchase, same guard as SPONSOR_TIERS: a
+ * client that could name its own price could sponsor the campaign for a cent.
+ *
+ * `priceCents` is the total package price. `termMonths` is fixed at 3; the term chip on the
+ * checkout is hidden for this program because there is nothing to choose.
+ *
+ * Benefits are listed verbatim because they're what the sponsor is paying for and what the
+ * fulfilment tracker will later count against. The dollar values after each line are
+ * rate-card figures (what the sponsor would otherwise pay for that item), kept here so a sales
+ * page or receipt renders consistent numbers.
+ */
+export const GIVEAWAY_SPONSOR_TIERS = [
+  {
+    slug: 'silver',
+    name: 'Silver',
+    priceCents: 300_000,
+    termMonths: 3,
+    /**
+     * Self-serve means: the tier is in the public rate card, the checkout can purchase it, and
+     * the whole flow (pay → review → approve) runs without a human negotiation step. Diamond is
+     * the exception — see below.
+     */
+    selfServe: true,
+    blurb:
+      'Logo placement, 10 shout-outs, 14 giveaway videos, and 500 postcards. For local businesses looking for community visibility.',
+    rateCardCents: 290_000,
+    benefits: {
+      shoutouts: 10,
+      promotionalVideos: 14,
+      postcards: 500,
+      logoPlacement: 'standard',
+      featuredBusinessProfile: false,
+      spotlightVideos: 0,
+      eventRecognition: 'standard',
+      coBrandedGiveaway: false,
+      reporting: 'final',
+      categoryExclusivity: false,
+    },
+  },
+  {
+    slug: 'gold',
+    name: 'Gold',
+    priceCents: 500_000,
+    termMonths: 3,
+    selfServe: true,
+    blurb:
+      '30 shout-outs, 20 giveaway videos, 1,000 postcards, premium logo placement, and a featured sponsor profile.',
+    rateCardCents: 600_000,
+    benefits: {
+      shoutouts: 30,
+      promotionalVideos: 20,
+      postcards: 1_000,
+      logoPlacement: 'premium',
+      featuredBusinessProfile: true,
+      spotlightVideos: 0,
+      eventRecognition: 'premium',
+      coBrandedGiveaway: false,
+      reporting: 'final',
+      categoryExclusivity: false,
+    },
+  },
+  {
+    slug: 'platinum',
+    name: 'Platinum',
+    priceCents: 1_000_000,
+    termMonths: 3,
+    selfServe: true,
+    blurb:
+      '60 shout-outs, 40 giveaway videos, 2,500 postcards, priority branding, a dedicated sponsor spotlight video, and monthly reporting.',
+    rateCardCents: 1_260_000,
+    benefits: {
+      shoutouts: 60,
+      promotionalVideos: 40,
+      postcards: 2_500,
+      logoPlacement: 'priority',
+      featuredBusinessProfile: true,
+      spotlightVideos: 1,
+      eventRecognition: 'premium',
+      coBrandedGiveaway: true,
+      reporting: 'monthly',
+      categoryExclusivity: 'optional',
+    },
+  },
+  {
+    /**
+     * Diamond is deliberately NOT self-serve. "Negotiated category exclusivity" implies a
+     * conversation — pricing it as a credit-card purchase skips the one promise that makes the
+     * tier different from Platinum. The checkout refuses it; the landing page renders a
+     * Contact-us CTA on the Diamond card. The whole record flow (admin.create + hand-record
+     * payment) still works, so a signed Diamond deal lands in the same roster via admin tooling.
+     */
+    slug: 'diamond',
+    name: 'Diamond',
+    priceCents: 2_500_000,
+    termMonths: 3,
+    selfServe: false,
+    blurb:
+      '120 shout-outs, 80 giveaway videos, 5,000 postcards, 3 spotlight videos, premier branding, co-branded giveaway promotion, and negotiated category exclusivity.',
+    rateCardCents: 2_725_000,
+    benefits: {
+      shoutouts: 120,
+      promotionalVideos: 80,
+      postcards: 5_000,
+      logoPlacement: 'premier',
+      featuredBusinessProfile: true,
+      spotlightVideos: 3,
+      eventRecognition: 'premier',
+      coBrandedGiveaway: true,
+      reporting: 'monthly',
+      categoryExclusivity: 'negotiable',
+    },
+  },
+] as const;
+export type GiveawayTierSlug = (typeof GIVEAWAY_SPONSOR_TIERS)[number]['slug'];
