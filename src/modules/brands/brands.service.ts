@@ -394,6 +394,108 @@ export const brandsService = {
   },
 
   /**
+   * ═══ 2026-10-28 — SELF-SERVE DISABLE FRANCHISE MODE ═══
+   *
+   * The owner's reverse of `createForSelf` / `convertOwnBusinessToBrand`. One call that undoes
+   * brand mode cleanly, with guards so an operator never has their dashboard yanked overnight.
+   *
+   * Guards (refused with a clear error):
+   *   • Caller must be the brand's owner.
+   *   • No `active` BrandOperator rows — brand owner must retire or remove every truck first.
+   *   • No `pending` BrandInvite rows — the owner should revoke outstanding invites first.
+   *
+   * What gets removed:
+   *   • The Brand row.
+   *   • Every BrandMembership for the brand (the owner's own membership included).
+   *   • Every BrandInvite for the brand (terminal rows too — the brand is gone).
+   *   • Every BrandOperator for the brand (retired rows too, for the same reason).
+   *   • Every BrandSplit for the brand (the split ledger belongs to the brand's lifetime).
+   *   • `brand_id` cleared on every Business, Follow, Review that pointed here.
+   *
+   * What stays intact: the Business itself, its orders, its menu, its reviews, its followers,
+   * its Stripe account, its live sessions. Disabling franchise mode is a schema reversal, not
+   * a wipe. The owner can re-enable later from `/vendor/franchise` with one click.
+   */
+  async disableForSelf(principal: Principal, brandId: string) {
+    const brand = await BrandModel.findById(brandId).exec();
+    if (!brand) throw NotFoundError('Brand not found');
+    if (brand.owner_user_id !== principal.userId) {
+      throw BusinessRuleError(
+        ERROR_CODES.NOT_OWNER,
+        'Only the brand owner can disable franchise mode.',
+      );
+    }
+
+    /**
+     * The two "someone is relying on this brand" guards. Both lazy — we check in the moment of
+     * disable, not through an async job, so a race between "retire my last operator" and
+     * "disable brand" can't slip an operator out from under the data.
+     */
+    const { BrandOperatorModel } = await import('./brandOperator.model');
+    const { BrandInviteModel } = await import('./brandInvite.model');
+    const { BrandSplitModel } = await import('./brandSplit.model');
+    const { FollowModel } = await import('../livemap/livemap.model');
+    const { ReviewModel } = await import('../reviews/reviews.model');
+
+    const activeOperators = await BrandOperatorModel.countDocuments({
+      brand_id: brandId,
+      status: 'active',
+    }).exec();
+    if (activeOperators > 0) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        `Retire your ${activeOperators} active operator${activeOperators === 1 ? '' : 's'} first — disabling now would strand their dashboards and payouts.`,
+      );
+    }
+    const pendingInvites = await BrandInviteModel.countDocuments({
+      brand_id: brandId,
+      status: 'pending',
+    }).exec();
+    if (pendingInvites > 0) {
+      throw BusinessRuleError(
+        ERROR_CODES.BUSINESS_RULE,
+        `You have ${pendingInvites} pending invite${pendingInvites === 1 ? '' : 's'}. Revoke them from the brand overview first.`,
+      );
+    }
+
+    const brandIdStr = String(brand._id);
+    /**
+     * Order matters: clear the references FIRST (Business, Follow, Review), then wipe the
+     * franchise collections, then delete the brand itself. A reversed order would leave an
+     * orphan reference that reads through to a non-existent brand for a few milliseconds.
+     */
+    await BusinessModel.updateMany(
+      { brand_id: brand._id },
+      { $set: { brand_id: null } },
+    ).exec();
+    await FollowModel.updateMany(
+      { brand_id: brandIdStr },
+      { $set: { brand_id: null } },
+    ).exec();
+    await ReviewModel.updateMany(
+      { brand_id: brandIdStr },
+      { $set: { brand_id: null } },
+    ).exec();
+
+    await BrandMembershipModel.deleteMany({ brand_id: brand._id }).exec();
+    await BrandInviteModel.deleteMany({ brand_id: brand._id }).exec();
+    await BrandOperatorModel.deleteMany({ brand_id: brand._id }).exec();
+    await BrandSplitModel.deleteMany({ brand_id: brand._id }).exec();
+
+    await BrandModel.deleteOne({ _id: brand._id }).exec();
+
+    await writeAudit({
+      actorId: principal.userId,
+      action: 'brand.disabled.self_serve',
+      entityType: 'brand',
+      entityId: brandIdStr,
+      metadata: { name: brand.name },
+    });
+
+    return { brandId: brandIdStr, disabled: true };
+  },
+
+  /**
    * ═══ 2026-10-28 — SELF-SERVE CONVERT-TO-BRAND ═══
    *
    * The business OWNER converts their own business into a brand. No admin. Delegates to the

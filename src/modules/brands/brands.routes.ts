@@ -593,6 +593,27 @@ brandOperatorPrivateRouter.put(
   }),
 );
 
+/**
+ * Owner self-serve disable franchise mode — the reverse of /me/businesses/:id/convert-to-brand.
+ * Refuses if there are active operators or pending invites; the service error message tells
+ * the owner what to clean up first.
+ */
+brandOperatorPrivateRouter.post(
+  '/me/brands/:id/disable',
+  rateLimit('write'),
+  authenticate,
+  validate({ params: IdParam }),
+  asyncHandler(async (req: Request, res: Response) => {
+    ok(
+      res,
+      await brandsService.disableForSelf(
+        principal(req),
+        params<z.infer<typeof IdParam>>(req).id,
+      ),
+    );
+  }),
+);
+
 /** Owner self-serve retire — the operator route the admin had, now owner-callable. */
 brandOperatorPrivateRouter.post(
   '/me/brand-operators/:operatorId/retire',
